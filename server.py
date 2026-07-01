@@ -4,6 +4,8 @@ Flask 后端服务
 """
 import json
 import os
+import shlex
+import stat
 import sys
 import subprocess
 import threading
@@ -99,12 +101,16 @@ class SSHClient:
         self.client.connect(**connect_kwargs)
         return True
 
-    def exec_command(self, cmd, timeout=120):
+    def exec_command(self, cmd, timeout=120, input_data=None, get_pty=False):
         """执行远程命令"""
         if not self.client:
             return -1, "", "SSH 未连接"
         try:
-            stdin, stdout, stderr = self.client.exec_command(cmd, timeout=timeout)
+            stdin, stdout, stderr = self.client.exec_command(cmd, timeout=timeout, get_pty=get_pty)
+            if input_data is not None:
+                stdin.write(input_data)
+                stdin.flush()
+                stdin.channel.shutdown_write()
             out = stdout.read().decode("utf-8", errors="replace")
             err = stderr.read().decode("utf-8", errors="replace")
             exit_code = stdout.channel.recv_exit_status()
@@ -112,19 +118,68 @@ class SSHClient:
         except Exception as e:
             return -1, "", str(e)
 
+    def prepare_remote_dir(self, remote_dir):
+        """Create a writable remote deploy directory for the current SSH user."""
+        remote_dir_q = shlex.quote(remote_dir)
+        writable_check = f"test -d {remote_dir_q} && test -w {remote_dir_q}"
+        plain_cmd = f"mkdir -p -- {remote_dir_q} && {writable_check}"
+
+        rc, out, err = self.exec_command(plain_cmd)
+        if rc == 0:
+            return True, "plain", ""
+
+        root_script = shlex.quote(
+            'mkdir -p -- "$1" && chown -R "$2:$3" -- "$1" && chmod u+rwx -- "$1"'
+        )
+        sudo_cmd = (
+            "owner=$(id -un) && group=$(id -gn) && "
+            f"sudo -n sh -c {root_script} sh {remote_dir_q} \"$owner\" \"$group\" && "
+            f"{writable_check}"
+        )
+        rc, sudo_out, sudo_err = self.exec_command(sudo_cmd)
+        if rc == 0:
+            return True, "sudo", ""
+
+        if self.password:
+            sudo_password_cmd = (
+                "owner=$(id -un) && group=$(id -gn) && "
+                f"sudo -S -p '' sh -c {root_script} sh {remote_dir_q} \"$owner\" \"$group\" && "
+                f"{writable_check}"
+            )
+            rc, pass_out, pass_err = self.exec_command(
+                sudo_password_cmd,
+                input_data=f"{self.password}\n",
+            )
+            if rc == 0:
+                return True, "sudo-password", ""
+            sudo_out, sudo_err = pass_out, pass_err
+
+        detail = (sudo_err or sudo_out or err or out).strip()
+        return False, "failed", detail or "Unable to create writable remote directory"
+
     def _ensure_remote_dir(self, sftp, remote_dir):
         """递归创建远程目录（确保父目录存在）"""
-        parts = remote_dir.replace("\\", "/").strip("/").split("/")
-        current = ""
+        normalized = remote_dir.replace("\\", "/").rstrip("/")
+        if not normalized:
+            return
+
+        parts = [part for part in normalized.split("/") if part]
+        current = "/" if normalized.startswith("/") else ""
         for part in parts:
-            current = current + "/" + part
+            current = current.rstrip("/") + "/" + part if current else part
             try:
                 sftp.stat(current)
-            except IOError:
+            except OSError:
                 try:
                     sftp.mkdir(current)
-                except IOError:
+                except OSError:
                     pass  # 竞态条件：目录已被创建
+            try:
+                attrs = sftp.stat(current)
+            except OSError as stat_error:
+                raise RuntimeError(f"Failed to create remote directory: {current}; {stat_error}") from stat_error
+            if not stat.S_ISDIR(getattr(attrs, "st_mode", 0)):
+                raise RuntimeError(f"Remote path exists but is not a directory: {current}")
 
     def upload_dir(self, local_dir, remote_dir, excludes=None):
         """上传目录到远程（SFTP）"""
@@ -173,7 +228,7 @@ class SSHClient:
                             pass
 
             def _upload_recursive(local, remote):
-                _ensure_remote_dir(sftp, remote)
+                self._ensure_remote_dir(sftp, remote)
 
                 try:
                     items = os.listdir(local)
@@ -224,8 +279,13 @@ class SSHClient:
         if not self.client:
             return False, "SSH 未连接"
         sftp = self.client.open_sftp()
-        sftp.put(local_path, remote_path)
-        sftp.close()
+        try:
+            remote_parent = remote_path.replace("\\", "/").rsplit("/", 1)[0]
+            if remote_parent:
+                self._ensure_remote_dir(sftp, remote_parent)
+            sftp.put(local_path, remote_path)
+        finally:
+            sftp.close()
         return True, ""
 
     def close(self):
@@ -570,7 +630,14 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # Step 4: 创建远程目录 (40%)
         set_progress(40, "创建远程目录...")
         remote_dir = f"{server_path}/{module_name}"
-        ssh.exec_command(f'mkdir -p "{remote_dir}"')
+        remote_dir_q = shlex.quote(remote_dir)
+        ok, create_mode, create_error = ssh.prepare_remote_dir(remote_dir)
+        if not ok:
+            log_message(f"创建远程目录失败: {create_error}", "error")
+            set_progress(0, "创建远程目录失败")
+            return
+        if create_mode != "plain":
+            log_message("远程目录需要 sudo 初始化，已授权给当前 SSH 用户", "warn")
         log_message(f"远程目录: {remote_dir}")
 
         # Step 5: 同步文件 (50-70%) — 使用 SFTP
@@ -628,10 +695,10 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # Step 7: 远程 Docker 部署 (90%)
         set_progress(90, "远程构建和部署...")
         log_message("执行 docker compose pull...")
-        ssh.exec_command(f'cd "{remote_dir}" && {compose_prefix} -f docker-compose.yml pull', timeout=120)
+        ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml pull", timeout=120)
 
         log_message("执行 docker compose build...")
-        rc, out, err = ssh.exec_command(f'cd "{remote_dir}" && {compose_prefix} -f docker-compose.yml build', timeout=600)
+        rc, out, err = ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml build", timeout=600)
         if out:
             for line in out.strip().split("\n"):
                 if line.strip():
@@ -640,20 +707,26 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             for line in err.strip().split("\n"):
                 if line.strip():
                     log_message(line.strip(), "warn")
+        if rc != 0:
+            set_progress(0, "Docker 构建失败")
+            log_message("Docker 构建失败，已停止部署", "error")
+            return
 
         log_message("执行 docker compose up -d...")
         rc, out, err = ssh.exec_command(
-            f'cd "{remote_dir}" && {compose_prefix} -f docker-compose.yml up -d --remove-orphans', timeout=120
+            f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml up -d --remove-orphans", timeout=120
         )
         if rc == 0:
             log_message("容器启动成功！")
         else:
-            log_message(f"容器启动可能有问题: {err}", "warn")
+            set_progress(0, "容器启动失败")
+            log_message(f"容器启动失败: {err or out}", "error")
+            return
 
         # Step 8: 显示状态 (100%)
         set_progress(100, "部署完成！")
         log_message("获取容器状态...")
-        rc, out, err = ssh.exec_command(f'cd "{remote_dir}" && {compose_prefix} -f docker-compose.yml ps')
+        rc, out, err = ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml ps")
         if out:
             for line in out.strip().split("\n"):
                 if line.strip():
