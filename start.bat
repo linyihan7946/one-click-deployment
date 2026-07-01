@@ -21,7 +21,7 @@ if errorlevel 1 (
 echo [OK] Python 已安装
 
 echo [2/3] 安装依赖...
-pip install flask requests >nul 2>&1
+pip install flask paramiko >nul 2>&1
 echo [OK] 依赖已就绪
 
 echo [3/3] 启动服务...

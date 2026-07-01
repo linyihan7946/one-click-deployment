@@ -9,8 +9,13 @@ import subprocess
 import threading
 import tempfile
 import base64
+import time
+import io
+import fnmatch
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify
+
+import paramiko
 
 app = Flask(__name__)
 
@@ -56,66 +61,178 @@ def log_message(msg, level="info"):
         deploy_status["log"].append(entry)
 
 
-def run_command(cmd, cwd=None, timeout=300):
-    """运行命令并返回输出"""
-    try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            timeout=timeout,
-            encoding="utf-8",
-            errors="replace",
-        )
-        return result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", "命令执行超时"
-    except Exception as e:
-        return -1, "", str(e)
+# ========================
+#  Paramiko SSH 封装
+# ========================
 
+class SSHClient:
+    """paramiko SSH 客户端封装"""
 
-def generate_docker_compose(module_name, port=3000):
-    """生成 docker-compose.yml"""
-    return f"""version: "3.8"
+    def __init__(self, host, port, user, password=None, key_path=None):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.key_path = key_path
+        self.client = None
 
-services:
-  {module_name}:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: app-{module_name}
-    restart: unless-stopped
-    ports:
-      - "{port}:{port}"
-    environment:
-      - NODE_ENV=production
-    networks:
-      - app-network
+    def connect(self, timeout=15):
+        """建立 SSH 连接"""
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-networks:
-  app-network:
-    driver: bridge
-"""
+        connect_kwargs = {
+            "hostname": self.host,
+            "port": self.port,
+            "username": self.user,
+            "timeout": timeout,
+            "allow_agent": True,
+            "look_for_keys": True,
+        }
 
+        # 优先使用密钥
+        if self.key_path and os.path.exists(os.path.expanduser(self.key_path)):
+            connect_kwargs["key_filename"] = os.path.expanduser(self.key_path)
+        elif self.password:
+            connect_kwargs["password"] = self.password
 
-def generate_dockerfile():
-    """生成 Dockerfile"""
-    return """FROM node:20-alpine
+        self.client.connect(**connect_kwargs)
+        return True
 
-WORKDIR /app
+    def exec_command(self, cmd, timeout=120):
+        """执行远程命令"""
+        if not self.client:
+            return -1, "", "SSH 未连接"
+        try:
+            stdin, stdout, stderr = self.client.exec_command(cmd, timeout=timeout)
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+            exit_code = stdout.channel.recv_exit_status()
+            return exit_code, out, err
+        except Exception as e:
+            return -1, "", str(e)
 
-COPY package*.json ./
-RUN npm ci --production=false
+    def _ensure_remote_dir(self, sftp, remote_dir):
+        """递归创建远程目录（确保父目录存在）"""
+        parts = remote_dir.replace("\\", "/").strip("/").split("/")
+        current = ""
+        for part in parts:
+            current = current + "/" + part
+            try:
+                sftp.stat(current)
+            except IOError:
+                try:
+                    sftp.mkdir(current)
+                except IOError:
+                    pass  # 竞态条件：目录已被创建
 
-COPY . .
-RUN npm run build
+    def upload_dir(self, local_dir, remote_dir, excludes=None):
+        """上传目录到远程（SFTP）"""
+        if not self.client:
+            return False, "SSH 未连接"
 
-EXPOSE 3000
+        # 验证本地源路径
+        local_dir = os.path.abspath(local_dir)
+        if not os.path.exists(local_dir):
+            return False, f"本地路径不存在: {local_dir}"
+        if not os.path.isdir(local_dir):
+            return False, f"本地路径不是目录: {local_dir}"
 
-CMD ["node", "dist/index.js"]
-"""
+        if excludes is None:
+            excludes = []
+
+        import traceback
+
+        sftp = self.client.open_sftp()
+
+        try:
+            def _should_exclude(name):
+                name_lower = name.lower()
+                for exc in excludes:
+                    exc = exc.strip("/").lower()
+                    if "*" in exc or "?" in exc:
+                        if fnmatch.fnmatch(name_lower, exc):
+                            return True
+                    else:
+                        if exc == name_lower or exc in name_lower:
+                            return True
+                return False
+
+            def _ensure_remote_dir(sftp_conn, rdir):
+                """递归创建远程目录"""
+                parts = rdir.replace("\\", "/").strip("/").split("/")
+                current = ""
+                for part in parts:
+                    current = current + "/" + part
+                    try:
+                        sftp_conn.stat(current)
+                    except IOError:
+                        try:
+                            sftp_conn.mkdir(current)
+                        except IOError:
+                            pass
+
+            def _upload_recursive(local, remote):
+                _ensure_remote_dir(sftp, remote)
+
+                try:
+                    items = os.listdir(local)
+                except PermissionError:
+                    return
+                except OSError:
+                    return
+
+                for item in items:
+                    if _should_exclude(item):
+                        continue
+
+                    local_path = os.path.join(local, item)
+                    remote_path = remote + "/" + item
+
+                    if os.path.islink(local_path):
+                        continue
+
+                    if os.path.isdir(local_path):
+                        _upload_recursive(local_path, remote_path)
+                    elif os.path.isfile(local_path):
+                        try:
+                            sftp.put(local_path, remote_path)
+                        except Exception as e:
+                            import traceback
+                            tb = traceback.format_exc()
+                            raise RuntimeError(
+                                f"上传文件失败: local={local_path!r}, remote={remote_path!r}\n"
+                                f"Error: {e}\n{tb}"
+                            ) from e
+
+            _upload_recursive(local_dir, remote_dir)
+            return True, ""
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            return False, f"{str(e)}\n\nTraceback:\n{tb}"
+
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def upload_file(self, local_path, remote_path):
+        """上传单个文件"""
+        if not self.client:
+            return False, "SSH 未连接"
+        sftp = self.client.open_sftp()
+        sftp.put(local_path, remote_path)
+        sftp.close()
+        return True, ""
+
+    def close(self):
+        """关闭连接"""
+        if self.client:
+            self.client.close()
+            self.client = None
 
 
 # ========================
@@ -133,7 +250,6 @@ def index():
 def get_config():
     """获取配置"""
     config = load_config()
-    # 返回脱敏后的配置
     safe_config = {"servers": [], "modules": config.get("modules", []), "settings": config.get("settings", {})}
     for srv in config.get("servers", []):
         safe_srv = dict(srv)
@@ -151,11 +267,9 @@ def add_server():
     if "servers" not in config:
         config["servers"] = []
 
-    # 查找是否已存在
     found = False
     for i, srv in enumerate(config["servers"]):
         if srv.get("name") == data.get("name"):
-            # 保留旧密码（如果新密码为空）
             if not data.get("password") and srv.get("password"):
                 data["password"] = srv["password"]
             config["servers"][i] = data
@@ -225,7 +339,6 @@ def browse_directory():
     data = request.json
     path = data.get("path", "")
 
-    # 如果路径为空，返回常见根目录
     if not path:
         drives = []
         for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
@@ -247,9 +360,7 @@ def browse_directory():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-    # 排序：目录在前
     items.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
-
     return jsonify({"items": items})
 
 
@@ -262,7 +373,6 @@ def detect_project_type():
     if not path or not os.path.isdir(path):
         return jsonify({"type": "", "reason": "路径不存在"})
 
-    # 检测规则
     files = set()
     try:
         for item in os.listdir(path):
@@ -270,7 +380,6 @@ def detect_project_type():
     except Exception:
         return jsonify({"type": "", "reason": "无法读取目录"})
 
-    # Python: requirements.txt, pyproject.toml, Pipfile, setup.py
     if "requirements.txt" in files:
         return jsonify({"type": "python", "reason": "找到 requirements.txt"})
     if "pyproject.toml" in files:
@@ -282,7 +391,6 @@ def detect_project_type():
     if "app.py" in files or "main.py" in files or "wsgi.py" in files or "asgi.py" in files:
         return jsonify({"type": "python", "reason": "找到 app.py/main.py"})
 
-    # Java: pom.xml, build.gradle
     if "pom.xml" in files:
         return jsonify({"type": "java", "reason": "找到 pom.xml"})
     if "build.gradle" in files or "build.gradle.kts" in files:
@@ -290,24 +398,19 @@ def detect_project_type():
     if "settings.gradle" in files or "settings.gradle.kts" in files:
         return jsonify({"type": "java", "reason": "找到 settings.gradle"})
 
-    # Go: go.mod
     if "go.mod" in files:
         return jsonify({"type": "go", "reason": "找到 go.mod"})
 
-    # .NET: *.csproj, *.sln
     for f in files:
         if f.endswith(".csproj"):
             return jsonify({"type": "dotnet", "reason": f"找到 {f}"})
         if f.endswith(".sln"):
             return jsonify({"type": "dotnet", "reason": f"找到 {f}"})
 
-    # PHP: composer.json
     if "composer.json" in files:
         return jsonify({"type": "php", "reason": "找到 composer.json"})
 
-    # Node.js / Vue / React: package.json
     if "package.json" in files:
-        # 尝试读取 package.json 判断具体类型
         try:
             with open(os.path.join(path, "package.json"), "r", encoding="utf-8") as f:
                 pkg = json.load(f)
@@ -316,7 +419,7 @@ def detect_project_type():
             deps.update(pkg.get("devDependencies", {}))
             scripts = pkg.get("scripts", {})
 
-            if "vue" in deps or "@vue/cli-service" in deps or "vite" in deps and "vue" in str(deps):
+            if "vue" in deps or "@vue/cli-service" in deps:
                 return jsonify({"type": "vue", "reason": "检测到 Vue 项目"})
             if "react" in deps or "react-dom" in deps or "next" in deps:
                 return jsonify({"type": "vue", "reason": "检测到 React 项目"})
@@ -324,15 +427,12 @@ def detect_project_type():
                 return jsonify({"type": "vue", "reason": "检测到 React 项目"})
             if "nuxt" in deps or "@nuxt/cli" in deps:
                 return jsonify({"type": "vue", "reason": "检测到 Nuxt 项目"})
-
-            # 有 build 脚本的 Node.js 后端
             if "build" in scripts:
-                return jsonify({"type": "nodejs", "reason": "检测到 Node.js 项目 (有 build 脚本)"})
+                return jsonify({"type": "nodejs", "reason": "检测到 Node.js 项目"})
             return jsonify({"type": "nodejs", "reason": "找到 package.json"})
         except Exception:
             return jsonify({"type": "nodejs", "reason": "找到 package.json"})
 
-    # Static: index.html
     if "index.html" in files:
         return jsonify({"type": "static", "reason": "找到 index.html"})
 
@@ -341,7 +441,7 @@ def detect_project_type():
 
 @app.route("/api/ssh-test", methods=["POST"])
 def test_ssh():
-    """测试 SSH 连接"""
+    """测试 SSH 连接（使用 paramiko）"""
     data = request.json
     host = data.get("host", "")
     port = data.get("port", 22)
@@ -352,22 +452,21 @@ def test_ssh():
     if not host or not user:
         return jsonify({"success": False, "message": "主机和用户名不能为空"})
 
-    # 构建 SSH 命令
-    if password:
-        # 使用 sshpass
-        cmd = f'sshpass -p "{password}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {port} {user}@{host} "echo OK"'
-    elif key_path:
-        cmd = f'ssh -i "{key_path}" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {port} {user}@{host} "echo OK"'
-    else:
-        cmd = f'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p {port} {user}@{host} "echo OK"'
-
-    rc, stdout, stderr = run_command(cmd, timeout=15)
-
-    if rc == 0 and "OK" in stdout:
-        return jsonify({"success": True, "message": "SSH 连接成功！"})
-    else:
-        err_msg = stderr.strip() or "连接失败"
-        return jsonify({"success": False, "message": err_msg})
+    try:
+        ssh = SSHClient(host, int(port), user, password=password, key_path=key_path)
+        ssh.connect(timeout=15)
+        rc, out, err = ssh.exec_command("echo OK", timeout=10)
+        ssh.close()
+        if rc == 0 and "OK" in out:
+            return jsonify({"success": True, "message": "SSH 连接成功！"})
+        else:
+            return jsonify({"success": False, "message": err.strip() or "命令执行失败"})
+    except paramiko.AuthenticationException:
+        return jsonify({"success": False, "message": "认证失败：用户名或密码错误"})
+    except paramiko.SSHException as e:
+        return jsonify({"success": False, "message": f"SSH 错误: {str(e)}"})
+    except Exception as e:
+        return jsonify({"success": False, "message": f"连接失败: {str(e)}"})
 
 
 @app.route("/api/deploy", methods=["POST"])
@@ -386,7 +485,6 @@ def deploy():
         if not all([server_name, module_name, source_path, server_path]):
             return jsonify({"success": False, "message": "请填写完整的部署信息"})
 
-        # 启动部署线程
         deploy_status["running"] = True
         deploy_status["progress"] = 0
         deploy_status["message"] = "准备部署..."
@@ -404,46 +502,48 @@ def deploy():
 
 
 def run_deploy(server_name, module_name, source_path, server_path, data):
-    """执行部署流程"""
+    """执行部署流程（使用 paramiko）"""
     host = data.get("host", "")
     port = data.get("port", 22)
     user = data.get("user", "")
     password = data.get("password", "")
     key_path = data.get("key_path", "")
 
+    ssh = None
+
     def set_progress(pct, msg):
         with deploy_lock:
             deploy_status["progress"] = pct
             deploy_status["message"] = msg
 
-    def run_ssh_cmd(cmd, timeout=120):
-        """通过 SSH 执行远程命令"""
-        if password:
-            prefix = f'sshpass -p "{password}" ssh -o StrictHostKeyChecking=no -p {port} {user}@{host}'
-        elif key_path:
-            prefix = f'ssh -i "{key_path}" -o StrictHostKeyChecking=no -p {port} {user}@{host}'
-        else:
-            prefix = f'ssh -o StrictHostKeyChecking=no -p {port} {user}@{host}'
-
-        # 使用 base64 编码避免特殊字符问题
-        cmd_b64 = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
-        full_cmd = f'{prefix} "echo {cmd_b64} | base64 -d | bash"'
-        return run_command(full_cmd, timeout=timeout)
-
     try:
-        # Step 1: 测试 SSH 连接 (10%)
-        set_progress(10, "测试 SSH 连接...")
+        # Step 0: 验证本地源路径
+        source_path = os.path.abspath(source_path)
+        if not os.path.exists(source_path):
+            set_progress(0, "本地源路径不存在")
+            log_message(f"本地路径不存在: {source_path}", "error")
+            return
+        if not os.path.isdir(source_path):
+            set_progress(0, "本地源路径不是目录")
+            log_message(f"本地路径不是目录: {source_path}", "error")
+            return
+        log_message(f"本地源目录: {source_path}")
+
+        # Step 1: SSH 连接 (10%)
+        set_progress(10, "连接服务器...")
         log_message(f"连接到 {user}@{host}:{port}")
-        rc, out, err = run_ssh_cmd("echo SSH_OK", timeout=15)
+        ssh = SSHClient(host, int(port), user, password=password, key_path=key_path)
+        ssh.connect(timeout=15)
+        rc, out, err = ssh.exec_command("echo SSH_OK", timeout=10)
         if rc != 0:
             set_progress(0, "SSH 连接失败")
             log_message(f"SSH 连接失败: {err}", "error")
             return
         log_message("SSH 连接成功")
 
-        # Step 2: 检查远程 Docker (20%)
+        # Step 2: 检查 Docker (20%)
         set_progress(20, "检查远程 Docker...")
-        rc, out, err = run_ssh_cmd("docker --version")
+        rc, out, err = ssh.exec_command("docker --version")
         if rc != 0:
             set_progress(0, "远程服务器未安装 Docker")
             log_message("远程服务器未安装 Docker", "error")
@@ -452,16 +552,16 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
 
         # Step 3: 检查 Docker Compose (30%)
         set_progress(30, "检查 Docker Compose...")
-        rc, out, err = run_ssh_cmd("docker compose version")
+        rc, out, err = ssh.exec_command("docker compose version")
         compose_prefix = "docker compose"
         if rc != 0:
-            rc2, out2, err2 = run_ssh_cmd("docker-compose --version")
+            rc2, out2, err2 = ssh.exec_command("docker-compose --version")
             if rc2 == 0:
                 compose_prefix = "docker-compose"
             else:
                 log_message("未检测到 Docker Compose，尝试安装...", "warn")
-                run_ssh_cmd(
-                    "sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose; sudo chmod +x /usr/local/bin/docker-compose",
+                ssh.exec_command(
+                    "sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose && sudo chmod +x /usr/local/bin/docker-compose",
                     timeout=120,
                 )
                 compose_prefix = "docker-compose"
@@ -470,111 +570,81 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # Step 4: 创建远程目录 (40%)
         set_progress(40, "创建远程目录...")
         remote_dir = f"{server_path}/{module_name}"
-        run_ssh_cmd(f"mkdir -p {remote_dir}")
+        ssh.exec_command(f'mkdir -p "{remote_dir}"')
         log_message(f"远程目录: {remote_dir}")
 
-        # Step 5: 同步文件 (50-70%)
+        # Step 5: 同步文件 (50-70%) — 使用 SFTP
         set_progress(50, "同步文件到服务器...")
-        log_message("开始同步文件...")
+        log_message("开始同步文件（SFTP）...")
 
-        # 检测 rsync
-        has_rsync = subprocess.run("rsync --version", shell=True, capture_output=True).returncode == 0
+        excludes = [
+            ".git",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            "node_modules",
+            ".env",
+            "__pycache__",
+            ".claude",
+            ".vscode",
+            ".idea",
+            ".deploy-logs",
+            ".deploy-ssh",
+            "logs",
+            "*.log",
+            "*.pyc",
+            ".DS_Store",
+            "Thumbs.db",
+        ]
 
-        if has_rsync:
-            log_message("使用 rsync 同步...")
-            excludes = [
-                ".git",
-                "node_modules",
-                ".env",
-                "*.log",
-                ".claude",
-                ".vscode",
-                "__pycache__",
-                ".deploy-logs",
-                ".deploy-ssh",
-            ]
-            exclude_args = " ".join([f"--exclude={e}" for e in excludes])
-            ssh_opt = f"ssh -o StrictHostKeyChecking=no -p {port}"
-            if key_path:
-                ssh_opt += f" -i \"{key_path}\""
-            elif password:
-                ssh_opt = f"sshpass -p \"{password}\" {ssh_opt}"
-
-            source = source_path.rstrip("\\/").replace("\\", "/") + "/"
-            rsync_cmd = f'rsync -avz --delete --no-perms --no-owner --no-group {exclude_args} -e "{ssh_opt}" "{source}" "{user}@{host}:{remote_dir}/"'
-            rc, out, err = run_command(rsync_cmd, cwd=None, timeout=300)
-            if rc == 0:
-                log_message("rsync 同步完成")
-            else:
-                log_message(f"rsync 失败，切换 scp 模式: {err}", "warn")
-                has_rsync = False
-
-        if not has_rsync:
-            log_message("使用 scp + tar 同步...")
-            # 创建临时压缩包
-            temp_zip = os.path.join(tempfile.gettempdir(), f"deploy_{datetime.now().strftime('%Y%m%d%H%M%S')}.tar.gz")
-            exclude_args = []
-            for e in [".git", "node_modules", ".env", "*.log", ".claude", ".vscode", ".deploy-logs", ".deploy-ssh"]:
-                exclude_args.extend(["--exclude", e])
-
-            tar_cmd = ["tar", "cfz", temp_zip] + exclude_args + ["-C", source_path, "."]
-            subprocess.run(tar_cmd, capture_output=True)
-
-            if os.path.exists(temp_zip):
-                size_mb = round(os.path.getsize(temp_zip) / 1024 / 1024, 2)
-                log_message(f"压缩包大小: {size_mb}MB")
-
-                # 上传
-                scp_cmd = f'scp -o StrictHostKeyChecking=no -P {port} "{temp_zip}" "{user}@{host}:{remote_dir}/deploy.tar.gz"'
-                if key_path:
-                    scp_cmd = f'scp -i "{key_path}" -o StrictHostKeyChecking=no -P {port} "{temp_zip}" "{user}@{host}:{remote_dir}/deploy.tar.gz"'
-                elif password:
-                    scp_cmd = f'sshpass -p "{password}" {scp_cmd}'
-
-                rc, out, err = run_command(scp_cmd, timeout=300)
-                if rc == 0:
-                    # 远程解压
-                    run_ssh_cmd(f"cd {remote_dir}; tar xfz deploy.tar.gz; rm -f deploy.tar.gz")
-                    log_message("scp 同步完成")
-                else:
-                    log_message(f"上传失败: {err}", "error")
-
-                # 清理临时文件
-                try:
-                    os.remove(temp_zip)
-                except Exception:
-                    pass
+        success, err_msg = ssh.upload_dir(source_path, remote_dir, excludes=excludes)
+        if success:
+            log_message("文件同步完成（SFTP）")
+        else:
+            log_message(f"文件同步失败: {err_msg}", "error")
+            set_progress(0, "文件同步失败")
+            return
 
         set_progress(70, "文件同步完成")
 
-        # Step 6: 生成 docker-compose.yml (80%)
+        # Step 6: 写入 docker-compose.yml (80%)
         set_progress(80, "生成部署配置...")
-        compose_content = data.get("docker_compose", generate_docker_compose(module_name))
-        compose_b64 = base64.b64encode(compose_content.encode("utf-8")).decode("ascii")
-        run_ssh_cmd(f"echo {compose_b64} | base64 -d > {remote_dir}/docker-compose.yml")
-        log_message("docker-compose.yml 已生成")
+        compose_content = data.get("docker_compose", "")
+        if compose_content:
+            # 通过 SFTP 写入文件
+            sftp = ssh.client.open_sftp()
+            with sftp.file(f"{remote_dir}/docker-compose.yml", "w") as f:
+                f.write(compose_content)
+            log_message("docker-compose.yml 已写入")
 
-        # 生成 Dockerfile（如果需要）
+        # 写入 Dockerfile
         dockerfile_content = data.get("dockerfile", "")
         if dockerfile_content:
-            df_b64 = base64.b64encode(dockerfile_content.encode("utf-8")).decode("ascii")
-            run_ssh_cmd(f"echo {df_b64} | base64 -d > {remote_dir}/Dockerfile")
-            log_message("Dockerfile 已生成")
+            sftp = ssh.client.open_sftp()
+            with sftp.file(f"{remote_dir}/Dockerfile", "w") as f:
+                f.write(dockerfile_content)
+            log_message("Dockerfile 已写入")
 
         # Step 7: 远程 Docker 部署 (90%)
         set_progress(90, "远程构建和部署...")
         log_message("执行 docker compose pull...")
-        run_ssh_cmd(f"cd {remote_dir}; {compose_prefix} -f docker-compose.yml pull", timeout=120)
+        ssh.exec_command(f'cd "{remote_dir}" && {compose_prefix} -f docker-compose.yml pull', timeout=120)
 
         log_message("执行 docker compose build...")
-        rc, out, err = run_ssh_cmd(f"cd {remote_dir}; {compose_prefix} -f docker-compose.yml build", timeout=300)
+        rc, out, err = ssh.exec_command(f'cd "{remote_dir}" && {compose_prefix} -f docker-compose.yml build', timeout=600)
         if out:
-            log_message(out.strip())
+            for line in out.strip().split("\n"):
+                if line.strip():
+                    log_message(line.strip())
         if err:
-            log_message(err.strip(), "warn")
+            for line in err.strip().split("\n"):
+                if line.strip():
+                    log_message(line.strip(), "warn")
 
         log_message("执行 docker compose up -d...")
-        rc, out, err = run_ssh_cmd(f"cd {remote_dir}; {compose_prefix} -f docker-compose.yml up -d --remove-orphans", timeout=120)
+        rc, out, err = ssh.exec_command(
+            f'cd "{remote_dir}" && {compose_prefix} -f docker-compose.yml up -d --remove-orphans', timeout=120
+        )
         if rc == 0:
             log_message("容器启动成功！")
         else:
@@ -583,17 +653,30 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # Step 8: 显示状态 (100%)
         set_progress(100, "部署完成！")
         log_message("获取容器状态...")
-        rc, out, err = run_ssh_cmd(f"cd {remote_dir}; {compose_prefix} -f docker-compose.yml ps")
+        rc, out, err = ssh.exec_command(f'cd "{remote_dir}" && {compose_prefix} -f docker-compose.yml ps')
         if out:
-            log_message(out.strip())
+            for line in out.strip().split("\n"):
+                if line.strip():
+                    log_message(line.strip())
 
         with deploy_lock:
             deploy_status["success"] = True
+
+    except paramiko.AuthenticationException:
+        log_message("认证失败：用户名或密码错误", "error")
+        with deploy_lock:
+            deploy_status["success"] = False
+    except paramiko.SSHException as e:
+        log_message(f"SSH 错误: {str(e)}", "error")
+        with deploy_lock:
+            deploy_status["success"] = False
     except Exception as e:
         log_message(f"部署出错: {str(e)}", "error")
         with deploy_lock:
             deploy_status["success"] = False
     finally:
+        if ssh:
+            ssh.close()
         with deploy_lock:
             deploy_status["running"] = False
 
