@@ -1,0 +1,1442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>一键部署 - Docker 远程部署工具</title>
+    <style>
+        :root {
+            --primary: #3b82f6;
+            --primary-dark: #2563eb;
+            --success: #22c55e;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --bg: #0f172a;
+            --bg-card: #1e293b;
+            --bg-input: #334155;
+            --border: #475569;
+            --text: #f1f5f9;
+            --text-dim: #94a3b8;
+            --text-muted: #64748b;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1e3a5f 0%, #0f172a 100%);
+            padding: 24px 32px;
+            border-bottom: 1px solid var(--border);
+        }
+        .header h1 {
+            font-size: 24px;
+            font-weight: 700;
+            background: linear-gradient(90deg, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .header p { color: var(--text-dim); margin-top: 4px; font-size: 14px; }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }
+        .card-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-title .icon { font-size: 20px; }
+
+        .full-width { grid-column: 1 / -1; }
+
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: var(--text-dim);
+            margin-bottom: 6px;
+            font-weight: 500;
+        }
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .form-row-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 12px;
+        }
+
+        input, select, textarea {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+        }
+        textarea { resize: vertical; min-height: 160px; font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; line-height: 1.5; }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .btn:active { transform: scale(0.97); }
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:hover { background: var(--primary-dark); }
+        .btn-success { background: var(--success); color: white; }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-warning { background: var(--warning); color: #1a1a1a; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+        .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-dim); }
+        .btn-outline:hover { border-color: var(--primary); color: var(--primary); }
+
+        .btn-group { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+
+        .server-list, .module-list {
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .server-item, .module-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            background: var(--bg-input);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+            border: 1px solid transparent;
+        }
+        .server-item:hover, .module-item:hover { border-color: var(--primary); }
+        .server-item.selected, .module-item.selected {
+            border-color: var(--primary);
+            background: rgba(59, 130, 246, 0.1);
+        }
+        .item-info h4 { font-size: 14px; font-weight: 600; }
+        .item-info p { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+
+        .path-browser {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .path-browser .current-path {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+            color: var(--text-dim);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .path-browser .current-path input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--text);
+            font-size: 13px;
+            padding: 0;
+        }
+        .path-browser .current-path input:focus { box-shadow: none; }
+        .path-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            transition: background 0.15s;
+        }
+        .path-item:hover { background: rgba(59, 130, 246, 0.1); }
+        .path-item .icon { font-size: 16px; }
+        .path-item.selected { background: rgba(59, 130, 246, 0.15); color: var(--primary); }
+
+        .deploy-section {
+            grid-column: 1 / -1;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }
+
+        .deploy-btn-area { text-align: center; padding: 20px 0; }
+        .deploy-big-btn {
+            padding: 16px 48px;
+            font-size: 18px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: 700;
+            transition: all 0.3s;
+            box-shadow: 0 4px 20px rgba(59, 130, 246, 0.3);
+        }
+        .deploy-big-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 30px rgba(59, 130, 246, 0.4);
+        }
+        .deploy-big-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .progress-bar {
+            height: 8px;
+            background: var(--bg-input);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 16px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+            border-radius: 4px;
+            transition: width 0.3s;
+        }
+        .progress-text {
+            font-size: 14px;
+            color: var(--text-dim);
+            text-align: center;
+        }
+
+        .log-console {
+            background: #0d1117;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            line-height: 1.6;
+        }
+        .log-console::-webkit-scrollbar { width: 6px; }
+        .log-console::-webkit-scrollbar-track { background: transparent; }
+        .log-console::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        .log-entry { margin: 2px 0; }
+        .log-entry .time { color: var(--text-muted); }
+        .log-entry .msg { color: var(--text); }
+        .log-entry.warn .msg { color: var(--warning); }
+        .log-entry.error .msg { color: var(--danger); }
+        .log-entry.success .msg { color: var(--success); }
+
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .status-idle { background: var(--text-muted); }
+        .status-running { background: var(--warning); animation: pulse 1.5s infinite; }
+        .status-success { background: var(--success); }
+        .status-error { background: var(--danger); }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 16px;
+        }
+        .tab {
+            padding: 10px 16px;
+            cursor: pointer;
+            font-size: 14px;
+            color: var(--text-muted);
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab:hover { color: var(--text); }
+        .tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            z-index: 1000;
+            animation: slideIn 0.3s ease;
+            max-width: 400px;
+        }
+        .toast-success { background: var(--success); color: white; }
+        .toast-error { background: var(--danger); color: white; }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        .empty-state { text-align: center; padding: 32px; color: var(--text-muted); }
+        .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+
+        /* 项目类型选择器 */
+        .project-types {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        .project-type-btn {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+            padding: 14px 8px;
+            background: var(--bg-input);
+            border: 2px solid var(--border);
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: var(--text-dim);
+        }
+        .project-type-btn:hover {
+            border-color: var(--primary);
+            color: var(--text);
+        }
+        .project-type-btn.selected {
+            border-color: var(--primary);
+            background: rgba(59, 130, 246, 0.1);
+            color: var(--primary);
+        }
+        .project-type-btn .icon { font-size: 28px; }
+        .project-type-btn .label { font-size: 12px; font-weight: 600; }
+        .project-type-btn .desc { font-size: 10px; color: var(--text-muted); }
+
+        .template-notice {
+            background: rgba(59, 130, 246, 0.08);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
+            font-size: 13px;
+            color: var(--text-dim);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .template-notice .icon { font-size: 18px; }
+
+        @media (max-width: 768px) {
+            .container { grid-template-columns: 1fr; padding: 16px; }
+            .form-row, .form-row-3 { grid-template-columns: 1fr; }
+            .project-types { grid-template-columns: repeat(3, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚀 一键部署</h1>
+        <p>Docker Compose 远程部署工具 - 填写信息，一键部署到服务器</p>
+    </div>
+
+    <div class="container">
+        <!-- 左侧：服务器配置 -->
+        <div class="card">
+            <div class="card-title">
+                <span class="icon">🖥️</span>
+                服务器配置
+                <span class="status-indicator status-idle" id="sshDot"></span>
+            </div>
+
+            <div class="tabs">
+                <div class="tab active" data-tab="server-form">填写</div>
+                <div class="tab" data-tab="server-list">已保存 (<span id="serverCount">0</span>)</div>
+            </div>
+
+            <div class="tab-content active" id="tab-server-form">
+                <div class="form-group">
+                    <label>服务器名称</label>
+                    <input type="text" id="srvName" placeholder="例如: production">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>服务器 IP / 域名</label>
+                        <input type="text" id="srvHost" placeholder="192.168.1.100">
+                    </div>
+                    <div class="form-group">
+                        <label>SSH 端口</label>
+                        <input type="number" id="srvPort" value="22" placeholder="22">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>用户名</label>
+                        <input type="text" id="srvUser" placeholder="root">
+                    </div>
+                    <div class="form-group">
+                        <label>密码</label>
+                        <input type="password" id="srvPassword" placeholder="SSH 密码">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>SSH 私钥路径（可选，优先于密码）</label>
+                    <input type="text" id="srvKeyPath" placeholder="C:\Users\YourName\.ssh\id_ed25519">
+                </div>
+                <div class="form-group">
+                    <label>远程部署根路径</label>
+                    <input type="text" id="srvDeployPath" placeholder="/opt/deploy" value="/opt/deploy">
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" onclick="saveServer()">💾 保存</button>
+                    <button class="btn btn-outline" onclick="testSSH()">🔗 测试连接</button>
+                </div>
+                <div id="sshResult" style="margin-top:10px; font-size:12px;"></div>
+            </div>
+
+            <div class="tab-content" id="tab-server-list">
+                <div class="server-list" id="serverList">
+                    <div class="empty-state">
+                        <div class="icon">🖥️</div>
+                        <p>暂无已保存的服务器</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 右侧：模块配置 -->
+        <div class="card">
+            <div class="card-title">
+                <span class="icon">📦</span>
+                模块配置
+            </div>
+
+            <div class="tabs">
+                <div class="tab active" data-tab="module-form">填写</div>
+                <div class="tab" data-tab="module-list">已保存 (<span id="moduleCount">0</span>)</div>
+            </div>
+
+            <div class="tab-content active" id="tab-module-form">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>模块名称</label>
+                        <input type="text" id="modName" placeholder="例如: web">
+                    </div>
+                    <div class="form-group">
+                        <label>远程子路径</label>
+                        <input type="text" id="modServerPath" placeholder="web" value="web">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>本地项目目录</label>
+                    <input type="text" id="modSourcePath" placeholder="选择或输入本地项目路径">
+                    <div class="btn-group" style="margin-top:8px;">
+                        <button class="btn btn-outline btn-sm" onclick="openPathBrowser()">📁 浏览目录</button>
+                        <button class="btn btn-outline btn-sm" onclick="detectProjectType()">🔍 自动检测项目类型</button>
+                    </div>
+                </div>
+
+                <!-- 目录浏览器 -->
+                <div id="pathBrowser" style="display:none; margin-top:12px;">
+                    <div class="path-browser">
+                        <div class="current-path">
+                            <span>📁</span>
+                            <input type="text" id="browserPath" value="" placeholder="选择路径...">
+                            <button class="btn btn-sm btn-outline" onclick="browsePath()">进入</button>
+                            <button class="btn btn-sm btn-outline" onclick="closePathBrowser()">✕</button>
+                        </div>
+                        <div id="browserItems"></div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>暴露端口</label>
+                    <input type="number" id="modPort" value="3000" placeholder="3000">
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-primary" onclick="saveModule()">💾 保存</button>
+                </div>
+            </div>
+
+            <div class="tab-content" id="tab-module-list">
+                <div class="module-list" id="moduleList">
+                    <div class="empty-state">
+                        <div class="icon">📦</div>
+                        <p>暂无已保存的模块</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 底部：Docker 配置 -->
+        <div class="card full-width">
+            <div class="card-title">
+                <span class="icon">⚙️</span>
+                Docker 配置
+            </div>
+
+            <!-- 项目类型选择 -->
+            <label style="font-size:13px; color:var(--text-dim); margin-bottom:10px; display:block; font-weight:500;">
+                项目类型（选择后自动填充模板，无需手写）
+            </label>
+            <div class="project-types" id="projectTypes">
+                <div class="project-type-btn" data-type="nodejs" onclick="selectProjectType('nodejs')">
+                    <span class="icon">🟢</span>
+                    <span class="label">Node.js</span>
+                    <span class="desc">npm/yarn</span>
+                </div>
+                <div class="project-type-btn" data-type="python" onclick="selectProjectType('python')">
+                    <span class="icon">🐍</span>
+                    <span class="label">Python</span>
+                    <span class="desc">Flask/Django/FastAPI</span>
+                </div>
+                <div class="project-type-btn" data-type="vue" onclick="selectProjectType('vue')">
+                    <span class="icon">💚</span>
+                    <span class="label">Vue/React</span>
+                    <span class="desc">前端 + Nginx</span>
+                </div>
+                <div class="project-type-btn" data-type="java" onclick="selectProjectType('java')">
+                    <span class="icon">☕</span>
+                    <span class="label">Java</span>
+                    <span class="desc">Spring Boot</span>
+                </div>
+                <div class="project-type-btn" data-type="go" onclick="selectProjectType('go')">
+                    <span class="icon">🔵</span>
+                    <span class="label">Go</span>
+                    <span class="desc">Golang</span>
+                </div>
+                <div class="project-type-btn" data-type="php" onclick="selectProjectType('php')">
+                    <span class="icon">🐘</span>
+                    <span class="label">PHP</span>
+                    <span class="desc">Laravel/ThinkPHP</span>
+                </div>
+                <div class="project-type-btn" data-type="dotnet" onclick="selectProjectType('dotnet')">
+                    <span class="icon">🟣</span>
+                    <span class="label">.NET</span>
+                    <span class="desc">ASP.NET Core</span>
+                </div>
+                <div class="project-type-btn" data-type="static" onclick="selectProjectType('static')">
+                    <span class="icon">📄</span>
+                    <span class="label">静态网站</span>
+                    <span class="desc">HTML/CSS/JS</span>
+                </div>
+            </div>
+
+            <div id="templateNotice" class="template-notice" style="display:none;">
+                <span class="icon">💡</span>
+                <span id="templateNoticeText"></span>
+            </div>
+
+            <div class="tabs">
+                <div class="tab active" data-tab="docker-compose">docker-compose.yml</div>
+                <div class="tab" data-tab="dockerfile-tab">Dockerfile</div>
+            </div>
+            <div class="tab-content active" id="tab-docker-compose">
+                <textarea id="dockerCompose" rows="12" spellcheck="false" placeholder="选择项目类型后自动填充..."></textarea>
+            </div>
+            <div class="tab-content" id="tab-dockerfile-tab">
+                <textarea id="dockerfile" rows="12" spellcheck="false" placeholder="选择项目类型后自动填充..."></textarea>
+            </div>
+        </div>
+
+        <!-- 部署区域 -->
+        <div class="deploy-section">
+            <div class="card-title">
+                <span class="icon">🚀</span>
+                部署控制台
+            </div>
+
+            <div class="form-row-3">
+                <div class="form-group">
+                    <label>选择服务器</label>
+                    <select id="deployServer">
+                        <option value="">-- 选择服务器 --</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>选择模块</label>
+                    <select id="deployModule">
+                        <option value="">-- 选择模块 --</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>本地项目目录</label>
+                    <input type="text" id="deploySourcePath" placeholder="选择或输入本地项目路径">
+                </div>
+            </div>
+
+            <div class="deploy-btn-area">
+                <button class="deploy-big-btn" id="deployBtn" onclick="startDeploy()">
+                    🚀 一键部署
+                </button>
+            </div>
+
+            <!-- 进度条 -->
+            <div id="progressArea" style="display:none;">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+                </div>
+                <div class="progress-text" id="progressText">准备中...</div>
+            </div>
+
+            <!-- 日志 -->
+            <div class="log-console" id="logConsole">
+                <div class="log-entry">
+                    <span class="time">--:--:--</span>
+                    <span class="msg" style="color: var(--text-muted);">等待部署...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ========================
+        //  Docker 模板库
+        // ========================
+        const TEMPLATES = {
+            nodejs: {
+                notice: 'Node.js 项目模板 - 自动安装依赖、构建并运行。如果启动命令不同，修改 CMD 即可。',
+                port: 3000,
+                dockerfile: `FROM node:20-alpine
+
+WORKDIR /app
+
+# 安装依赖
+COPY package*.json ./
+RUN npm ci --production=false
+
+# 复制源码并构建
+COPY . .
+RUN npm run build
+
+EXPOSE 3000
+
+CMD ["node", "dist/index.js"]`,
+                compose: `version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-nodejs
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge`
+            },
+
+            python: {
+                notice: 'Python 项目模板 - 使用 gunicorn 运行 Flask/FastAPI。如果是 Django，将模块名改为你的项目名。',
+                port: 8000,
+                dockerfile: `FROM python:3.12-slim
+
+WORKDIR /app
+
+# 安装依赖
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制源码
+COPY . .
+
+EXPOSE 8000
+
+# Flask/FastAPI 使用 gunicorn 启动
+# Flask:  CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]
+# FastAPI: CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "main:app"]
+# Django:  CMD ["gunicorn", "-b", "0.0.0.0:8000", "myproject.wsgi:application"]
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]`,
+                compose: `version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-python
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge`
+            },
+
+            vue: {
+                notice: 'Vue/React 前端模板 - 先 build 静态文件，再用 Nginx 托管。如果输出目录不同（dist/build），修改 nginx.conf 中的 root 路径。',
+                port: 80,
+                dockerfile: `# 构建阶段
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# 运行阶段
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]`,
+                compose: `version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge`,
+                extra: `// 同时创建 nginx.conf 文件:
+server {
+    listen 80;
+    server_name localhost;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}`
+            },
+
+            java: {
+                notice: 'Spring Boot 项目模板 - 需要项目中有 pom.xml 或 build.gradle。启动后自动运行 jar 包。',
+                port: 8080,
+                dockerfile: `FROM eclipse-temurin:21-jre-alpine
+
+WORKDIR /app
+
+# Maven 构建
+COPY pom.xml ./
+COPY src ./src
+RUN apk add --no-cache maven && mvn clean package -DskipTests
+
+# 或者 Gradle 构建 (取消注释)
+# COPY build.gradle settings.gradle ./
+# COPY src ./src
+# RUN apk add --no-cache openjdk21 gradle && gradle build -x test
+
+EXPOSE 8080
+CMD ["java", "-jar", "target/*.jar"]`,
+                compose: `version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-java
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge`
+            },
+
+            go: {
+                notice: 'Go 项目模板 - 编译为静态二进制文件，零依赖运行。修改 main.go 路径如果入口文件不同。',
+                port: 8080,
+                dockerfile: `# 构建阶段
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server ./main.go
+
+# 运行阶段
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/server .
+EXPOSE 8080
+CMD ["./server"]`,
+                compose: `version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-go
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge`
+            },
+
+            php: {
+                notice: 'PHP 项目模板 - 使用 Apache + PHP。如果是 Laravel，取消 composer install 行的注释。',
+                port: 80,
+                dockerfile: `FROM php:8.3-apache
+
+WORKDIR /var/www/html
+
+COPY . .
+
+# Laravel 项目取消注释:
+# RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+# RUN composer install --no-dev --optimize-autoloader
+
+RUN docker-php-ext-install pdo_mysql mysqli
+
+EXPOSE 80`,
+                compose: `version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-php
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - .:/var/www/html
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge`
+            },
+
+            dotnet: {
+                notice: '.NET 项目模板 - publish 后运行。如果端口不是 8080，修改 ASPNETCORE_URLS。',
+                port: 8080,
+                dockerfile: `FROM mcr.microsoft.com/dotnet/sdk:8.0 AS builder
+WORKDIR /src
+COPY *.csproj ./
+RUN dotnet restore
+COPY . .
+RUN dotnet publish -c Release -o /app/publish
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+WORKDIR /app
+COPY --from=builder /app/publish .
+EXPOSE 8080
+ENV ASPNETCORE_URLS=http://+:8080
+ENTRYPOINT ["dotnet", "YourProject.dll"]`,
+                compose: `version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-dotnet
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge`
+            },
+
+            static: {
+                notice: '静态网站模板 - 纯 HTML/CSS/JS 文件，直接用 Nginx 托管，无需构建。',
+                port: 80,
+                dockerfile: `FROM nginx:alpine
+
+COPY . /usr/share/nginx/html
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]`,
+                compose: `version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-static
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge`
+            }
+        };
+
+        // ========================
+        //  全局状态
+        // ========================
+        let config = { servers: [], modules: [], settings: {} };
+        let deployPollTimer = null;
+        let currentProjectType = '';
+
+        // ========================
+        //  Tab 切换
+        // ========================
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                const parent = tab.closest('.card, .deploy-section');
+                parent.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                const targetTab = tab.dataset.tab;
+                parent.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                document.getElementById('tab-' + targetTab).classList.add('active');
+            });
+        });
+
+        // ========================
+        //  Toast 通知
+        // ========================
+        function showToast(message, type = 'success') {
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }
+
+        // ========================
+        //  项目类型选择
+        // ========================
+        function selectProjectType(type) {
+            const template = TEMPLATES[type];
+            if (!template) return;
+
+            currentProjectType = type;
+
+            // 高亮选中
+            document.querySelectorAll('.project-type-btn').forEach(btn => {
+                btn.classList.toggle('selected', btn.dataset.type === type);
+            });
+
+            // 填充模板
+            document.getElementById('dockerCompose').value = template.compose;
+            document.getElementById('dockerfile').value = template.dockerfile;
+
+            // 更新端口
+            document.getElementById('modPort').value = template.port;
+
+            // 显示说明
+            const notice = document.getElementById('templateNotice');
+            const noticeText = document.getElementById('templateNoticeText');
+            notice.style.display = 'flex';
+            noticeText.textContent = template.notice;
+
+            // 如果有额外说明
+            if (template.extra) {
+                console.log(template.extra);
+            }
+        }
+
+        // ========================
+        //  加载配置
+        // ========================
+        async function loadConfig() {
+            try {
+                const resp = await fetch('/api/config');
+                config = await resp.json();
+                renderServerList();
+                renderModuleList();
+                updateDropdowns();
+            } catch (e) {
+                console.error('加载配置失败:', e);
+            }
+        }
+
+        // ========================
+        //  服务器管理
+        // ========================
+        async function saveServer() {
+            const data = {
+                name: document.getElementById('srvName').value.trim(),
+                host: document.getElementById('srvHost').value.trim(),
+                port: parseInt(document.getElementById('srvPort').value) || 22,
+                user: document.getElementById('srvUser').value.trim(),
+                password: document.getElementById('srvPassword').value,
+                key_path: document.getElementById('srvKeyPath').value.trim(),
+                deploy_path: document.getElementById('srvDeployPath').value.trim() || '/opt/deploy',
+            };
+
+            if (!data.name || !data.host || !data.user) {
+                showToast('请填写服务器名称、IP 和用户名', 'error');
+                return;
+            }
+
+            const resp = await fetch('/api/config/servers', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data),
+            });
+            const result = await resp.json();
+            showToast(result.message);
+            await loadConfig();
+
+            document.getElementById('srvName').value = '';
+            document.getElementById('srvHost').value = '';
+            document.getElementById('srvPassword').value = '';
+            document.getElementById('srvKeyPath').value = '';
+        }
+
+        async function deleteServer(name) {
+            if (!confirm(`确定删除服务器 "${name}"？`)) return;
+            await fetch(`/api/config/servers/${encodeURIComponent(name)}`, { method: 'DELETE' });
+            showToast('服务器已删除');
+            await loadConfig();
+        }
+
+        function renderServerList() {
+            const container = document.getElementById('serverList');
+            document.getElementById('serverCount').textContent = config.servers.length;
+
+            if (!config.servers.length) {
+                container.innerHTML = '<div class="empty-state"><div class="icon">🖥️</div><p>暂无已保存的服务器</p></div>';
+                return;
+            }
+
+            container.innerHTML = config.servers.map(s => `
+                <div class="server-item" onclick="selectServer('${s.name}')">
+                    <div class="item-info">
+                        <h4>${s.name}</h4>
+                        <p>${s.user}@${s.host}:${s.port} → ${s.deploy_path}</p>
+                    </div>
+                    <div>
+                        <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteServer('${s.name}')">删除</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function selectServer(name) {
+            const server = config.servers.find(s => s.name === name);
+            if (!server) return;
+
+            document.getElementById('srvName').value = server.name;
+            document.getElementById('srvHost').value = server.host;
+            document.getElementById('srvPort').value = server.port;
+            document.getElementById('srvUser').value = server.user;
+            document.getElementById('srvPassword').value = '';
+            document.getElementById('srvKeyPath').value = server.key_path || '';
+            document.getElementById('srvDeployPath').value = server.deploy_path;
+
+            document.querySelector('[data-tab="server-form"]').click();
+            showToast(`已选择服务器: ${name}`);
+        }
+
+        async function testSSH() {
+            const data = {
+                host: document.getElementById('srvHost').value.trim(),
+                port: parseInt(document.getElementById('srvPort').value) || 22,
+                user: document.getElementById('srvUser').value.trim(),
+                password: document.getElementById('srvPassword').value,
+                key_path: document.getElementById('srvKeyPath').value.trim(),
+            };
+
+            if (!data.host || !data.user) {
+                showToast('请填写 IP 和用户名', 'error');
+                return;
+            }
+
+            const dot = document.getElementById('sshDot');
+            const result = document.getElementById('sshResult');
+            dot.className = 'status-indicator status-running';
+            result.innerHTML = '<span style="color:var(--warning)">正在连接...</span>';
+
+            const resp = await fetch('/api/ssh-test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data),
+            });
+            const res = await resp.json();
+
+            if (res.success) {
+                dot.className = 'status-indicator status-success';
+                result.innerHTML = `<span style="color:var(--success)">✅ ${res.message}</span>`;
+                showToast('SSH 连接成功！');
+            } else {
+                dot.className = 'status-indicator status-error';
+                result.innerHTML = `<span style="color:var(--danger)">❌ ${res.message}</span>`;
+                showToast(res.message, 'error');
+            }
+        }
+
+        // ========================
+        //  模块管理
+        // ========================
+        async function saveModule() {
+            const data = {
+                name: document.getElementById('modName').value.trim(),
+                source_path: document.getElementById('modSourcePath').value.trim(),
+                server_path: document.getElementById('modServerPath').value.trim(),
+                port: parseInt(document.getElementById('modPort').value) || 3000,
+                project_type: currentProjectType,
+            };
+
+            if (!data.name || !data.source_path) {
+                showToast('请填写模块名称和本地项目目录', 'error');
+                return;
+            }
+
+            const resp = await fetch('/api/config/modules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data),
+            });
+            const result = await resp.json();
+            showToast(result.message);
+            await loadConfig();
+
+            document.getElementById('modName').value = '';
+            document.getElementById('modSourcePath').value = '';
+        }
+
+        async function deleteModule(name) {
+            if (!confirm(`确定删除模块 "${name}"？`)) return;
+            await fetch(`/api/config/modules/${encodeURIComponent(name)}`, { method: 'DELETE' });
+            showToast('模块已删除');
+            await loadConfig();
+        }
+
+        function renderModuleList() {
+            const container = document.getElementById('moduleList');
+            document.getElementById('moduleCount').textContent = config.modules.length;
+
+            if (!config.modules.length) {
+                container.innerHTML = '<div class="empty-state"><div class="icon">📦</div><p>暂无已保存的模块</p></div>';
+                return;
+            }
+
+            container.innerHTML = config.modules.map(m => `
+                <div class="module-item" onclick="selectModule('${m.name}')">
+                    <div class="item-info">
+                        <h4>${m.name} ${m.project_type ? `<span class="badge badge-blue">${m.project_type}</span>` : ''}</h4>
+                        <p>${m.source_path} → ${m.server_path}</p>
+                    </div>
+                    <div>
+                        <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteModule('${m.name}')">删除</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function selectModule(name) {
+            const mod = config.modules.find(m => m.name === name);
+            if (!mod) return;
+
+            document.getElementById('modName').value = mod.name;
+            document.getElementById('modSourcePath').value = mod.source_path;
+            document.getElementById('modServerPath').value = mod.server_path;
+            document.getElementById('modPort').value = mod.port;
+
+            if (mod.project_type) {
+                selectProjectType(mod.project_type);
+            }
+
+            document.querySelector('[data-tab="module-form"]').click();
+            showToast(`已选择模块: ${name}`);
+        }
+
+        // ========================
+        //  自动检测项目类型
+        // ========================
+        async function detectProjectType() {
+            const path = document.getElementById('modSourcePath').value.trim();
+            if (!path) {
+                showToast('请先输入项目目录路径', 'error');
+                return;
+            }
+
+            try {
+                const resp = await fetch('/api/detect-project-type', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: path }),
+                });
+                const result = await resp.json();
+
+                if (result.type) {
+                    selectProjectType(result.type);
+                    showToast(`检测到项目类型: ${result.type}（依据: ${result.reason}）`);
+                } else {
+                    showToast('未能自动检测项目类型，请手动选择', 'error');
+                }
+            } catch (e) {
+                showToast('检测失败: ' + e.message, 'error');
+            }
+        }
+
+        // ========================
+        //  目录浏览器
+        // ========================
+        function openPathBrowser() {
+            document.getElementById('pathBrowser').style.display = 'block';
+            browsePath('');
+        }
+
+        function closePathBrowser() {
+            document.getElementById('pathBrowser').style.display = 'none';
+        }
+
+        async function browsePath(path) {
+            const input = document.getElementById('browserPath');
+            if (path !== undefined) input.value = path;
+
+            const resp = await fetch('/api/browse', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: input.value }),
+            });
+            const data = await resp.json();
+
+            const container = document.getElementById('browserItems');
+            if (data.error) {
+                container.innerHTML = `<div class="path-item" style="color:var(--danger)">❌ ${data.error}</div>`;
+                return;
+            }
+
+            let html = '';
+
+            if (data.drives) {
+                html = data.drives.map(d =>
+                    `<div class="path-item" onclick="selectBrowsePath('${d.path.replace(/\\/g, '\\\\')}')">
+                        <span class="icon">💿</span> ${d.name}
+                    </div>`
+                ).join('');
+            }
+
+            if (data.items) {
+                const currentPath = input.value;
+                if (currentPath) {
+                    const parentPath = currentPath.substring(0, currentPath.lastIndexOf('\\'));
+                    if (parentPath) {
+                        html += `<div class="path-item" onclick="selectBrowsePath('${parentPath.replace(/\\/g, '\\\\')}')">
+                            <span class="icon">📂</span> ..
+                        </div>`;
+                    }
+                }
+
+                html += data.items.filter(item => item.type === 'dir').map(item =>
+                    `<div class="path-item" onclick="selectBrowsePath('${item.path.replace(/\\/g, '\\\\')}')">
+                        <span class="icon">📁</span> ${item.name}
+                    </div>`
+                ).join('');
+            }
+
+            container.innerHTML = html;
+        }
+
+        function selectBrowsePath(path) {
+            document.getElementById('browserPath').value = path;
+            document.getElementById('modSourcePath').value = path;
+            browsePath(path);
+        }
+
+        // ========================
+        //  下拉菜单更新
+        // ========================
+        function updateDropdowns() {
+            const serverSelect = document.getElementById('deployServer');
+            const moduleSelect = document.getElementById('deployModule');
+
+            serverSelect.innerHTML = '<option value="">-- 选择服务器 --</option>' +
+                config.servers.map(s => `<option value="${s.name}">${s.name} (${s.host})</option>`).join('');
+
+            moduleSelect.innerHTML = '<option value="">-- 选择模块 --</option>' +
+                config.modules.map(m => `<option value="${m.name}">${m.name} (${m.source_path})</option>`).join('');
+
+            moduleSelect.onchange = () => {
+                const mod = config.modules.find(m => m.name === moduleSelect.value);
+                if (mod) {
+                    document.getElementById('deploySourcePath').value = mod.source_path;
+                    if (mod.project_type) {
+                        selectProjectType(mod.project_type);
+                    }
+                }
+            };
+        }
+
+        // ========================
+        //  部署
+        // ========================
+        function startDeploy() {
+            const serverName = document.getElementById('deployServer').value;
+            const moduleName = document.getElementById('deployModule').value;
+            const sourcePath = document.getElementById('deploySourcePath').value.trim();
+
+            if (!serverName || !moduleName || !sourcePath) {
+                showToast('请选择服务器、模块并填写项目目录', 'error');
+                return;
+            }
+
+            const server = config.servers.find(s => s.name === serverName);
+
+            const data = {
+                server_name: serverName,
+                module_name: moduleName,
+                source_path: sourcePath,
+                server_path: server.deploy_path,
+                host: server.host,
+                port: server.port,
+                user: server.user,
+                password: server.password || '',
+                key_path: server.key_path || '',
+                docker_compose: document.getElementById('dockerCompose').value,
+                dockerfile: document.getElementById('dockerfile').value,
+            };
+
+            document.getElementById('deployBtn').disabled = true;
+            document.getElementById('deployBtn').textContent = '⏳ 部署中...';
+            document.getElementById('progressArea').style.display = 'block';
+            document.getElementById('logConsole').innerHTML = '';
+
+            fetch('/api/deploy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data),
+            }).then(resp => resp.json()).then(result => {
+                if (!result.success) {
+                    showToast(result.message, 'error');
+                    resetDeployBtn();
+                    return;
+                }
+                if (deployPollTimer) clearInterval(deployPollTimer);
+                deployPollTimer = setInterval(pollDeployStatus, 1000);
+            });
+        }
+
+        function resetDeployBtn() {
+            document.getElementById('deployBtn').disabled = false;
+            document.getElementById('deployBtn').textContent = '🚀 一键部署';
+        }
+
+        async function pollDeployStatus() {
+            const resp = await fetch('/api/deploy/status');
+            const status = await resp.json();
+
+            document.getElementById('progressFill').style.width = status.progress + '%';
+            document.getElementById('progressText').textContent = status.message;
+
+            const console = document.getElementById('logConsole');
+            if (status.log && status.log.length) {
+                console.innerHTML = status.log.map(entry =>
+                    `<div class="log-entry ${entry.level}">
+                        <span class="time">${entry.time}</span>
+                        <span class="msg">${escapeHtml(entry.message)}</span>
+                    </div>`
+                ).join('');
+                console.scrollTop = console.scrollHeight;
+            }
+
+            if (!status.running) {
+                clearInterval(deployPollTimer);
+                resetDeployBtn();
+                if (status.success) {
+                    showToast('部署成功！');
+                    addLogEntry('✅ 部署完成！', 'success');
+                } else {
+                    showToast('部署失败，请查看日志', 'error');
+                    addLogEntry('❌ 部署失败', 'error');
+                }
+            }
+        }
+
+        function addLogEntry(message, level = 'info') {
+            const console = document.getElementById('logConsole');
+            const time = new Date().toLocaleTimeString();
+            console.innerHTML += `<div class="log-entry ${level}">
+                <span class="time">${time}</span>
+                <span class="msg">${escapeHtml(message)}</span>
+            </div>`;
+            console.scrollTop = console.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // ========================
+        //  初始化
+        // ========================
+        loadConfig();
+    </script>
+</body>
+</html>

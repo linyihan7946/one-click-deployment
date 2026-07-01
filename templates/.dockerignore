@@ -1,0 +1,74 @@
+# 部署时排除的文件/目录
+
+# 版本控制
+.git/
+.gitignore
+.github/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Java
+target/
+*.class
+*.jar
+
+# Go
+vendor/
+*.exe
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 部署工具自身
+.deploy-ssh/
+.deploy-logs/
+deploy-config.json
+deploy.ps1
+templates/
+
+# 日志
+*.log
+logs/
+
+# 环境文件（使用配置中的 env 字段管理）
+.env
+.env.*
+!.env.example
+
+# Docker（服务器上单独构建）
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 测试
+tests/
+test/
+__tests__/
+*.test.*
+*.spec.*
+coverage/

@@ -1,0 +1,25 @@
+# Git 忽略文件
+
+# 部署配置 (包含敏感信息)
+deploy_config.json
+
+# SSH 密钥
+.deploy-ssh/
+
+# 部署日志
+logs/
+
+# 临时文件
+*.tar.gz
+deploy_*.tar.gz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/

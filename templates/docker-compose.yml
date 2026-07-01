@@ -1,0 +1,44 @@
+# Docker Compose 模板 - web 模块
+# 部署时会自动推送到服务器的 web/ 目录下
+# 根据实际需求修改
+
+version: "3.8"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # args:
+      #   NODE_ENV: production
+    container_name: app-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    volumes:
+      - ./data:/app/data
+    networks:
+      - app-network
+
+  # 数据库示例（按需启用）
+  # db:
+  #   image: postgres:16-alpine
+  #   container_name: app-db
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: ${DB_NAME:-app}
+  #     POSTGRES_USER: ${DB_USER:-admin}
+  #     POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+  #   volumes:
+  #     - db-data:/var/lib/postgresql/data
+  #   networks:
+  #     - app-network
+
+volumes:
+  db-data:
+
+networks:
+  app-network:
+    driver: bridge
