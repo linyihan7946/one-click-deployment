@@ -381,6 +381,26 @@
     </div>
 
     <div class="container">
+        <div class="card full-width">
+            <div class="card-title">
+                <span class="icon">🌐</span>
+                全局访问设置
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>访问域名</label>
+                    <input type="text" id="publicDomain" placeholder="www.aigenimage.cn" value="www.aigenimage.cn">
+                </div>
+                <div class="form-group">
+                    <label>访问格式</label>
+                    <input type="text" id="urlPreview" value="https://www.aigenimage.cn/项目名/" readonly>
+                </div>
+            </div>
+            <div class="btn-group">
+                <button class="btn btn-primary" onclick="saveSettings()">💾 保存全局设置</button>
+            </div>
+        </div>
+
         <!-- 左侧：服务器配置 -->
         <div class="card">
             <div class="card-title">
@@ -1013,12 +1033,52 @@ networks:
             try {
                 const resp = await fetch('/api/config');
                 config = await resp.json();
+                renderSettings();
                 renderServerList();
                 renderModuleList();
                 updateDropdowns();
             } catch (e) {
                 console.error('加载配置失败:', e);
             }
+        }
+
+        function normalizeDomain(value) {
+            return (value || 'www.aigenimage.cn')
+                .trim()
+                .replace(/^https?:\/\//i, '')
+                .split('/')[0]
+                .split(':')[0]
+                .toLowerCase() || 'www.aigenimage.cn';
+        }
+
+        function renderSettings() {
+            const settings = config.settings || {};
+            const domain = normalizeDomain(settings.public_domain || settings.domain || 'www.aigenimage.cn');
+            const domainInput = document.getElementById('publicDomain');
+            domainInput.value = domain;
+            updateUrlPreview();
+        }
+
+        function updateUrlPreview() {
+            const domain = normalizeDomain(document.getElementById('publicDomain').value);
+            document.getElementById('urlPreview').value = `https://${domain}/项目名/`;
+        }
+
+        async function saveSettings() {
+            const settings = {
+                ...(config.settings || {}),
+                public_domain: normalizeDomain(document.getElementById('publicDomain').value),
+            };
+
+            const resp = await fetch('/api/config/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings),
+            });
+            const result = await resp.json();
+            config.settings = settings;
+            updateUrlPreview();
+            showToast(result.message || '全局设置已保存');
         }
 
         // ========================
@@ -1357,6 +1417,7 @@ networks:
                 user: server.user,
                 password: server.password || '',
                 key_path: server.key_path || '',
+                public_domain: normalizeDomain(document.getElementById('publicDomain').value),
                 docker_compose: document.getElementById('dockerCompose').value,
                 dockerfile: document.getElementById('dockerfile').value,
             };
@@ -1436,6 +1497,7 @@ networks:
         // ========================
         //  初始化
         // ========================
+        document.getElementById('publicDomain').addEventListener('input', updateUrlPreview);
         loadConfig();
     </script>
 </body>

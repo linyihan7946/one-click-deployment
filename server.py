@@ -4,6 +4,7 @@ Flask 后端服务
 """
 import json
 import os
+import re
 import shlex
 import stat
 import sys
@@ -20,6 +21,86 @@ from flask import Flask, render_template, request, jsonify
 import paramiko
 
 app = Flask(__name__)
+
+
+def slugify_project_name(value):
+    """Return a URL-safe project slug for path-based deployment."""
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip("-._").lower()
+    return slug or "app"
+
+
+def normalize_public_domain(value):
+    """Normalize a user-entered public domain for gateway routing."""
+    domain = (value or "").strip()
+    domain = re.sub(r"^https?://", "", domain, flags=re.IGNORECASE)
+    domain = domain.split("/", 1)[0].split(":", 1)[0].strip().lower()
+    return domain or "www.aigenimage.cn"
+
+
+def gateway_domain_values(domain):
+    """Return server_name and certificate basename for a public domain."""
+    domain = normalize_public_domain(domain)
+    if domain.startswith("www."):
+        apex = domain[4:]
+        server_names = f"{domain} {apex}"
+        cert_base = apex
+    else:
+        server_names = f"{domain} www.{domain}"
+        cert_base = domain
+    return domain, server_names, cert_base
+
+
+def extract_first_container_port(compose_content):
+    """Best-effort extraction of the first container-side port from compose YAML text."""
+    for line in compose_content.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        value = stripped[1:].strip().strip("'\"")
+        if not value:
+            continue
+        if ":" in value:
+            value = value.split(":")[-1]
+        value = value.split("/")[0]
+        if value.isdigit():
+            return value
+    return ""
+
+
+def normalize_compose_for_path_gateway(compose_content):
+    """Convert host port mappings to internal expose entries for path-based gateway routing."""
+    lines = compose_content.splitlines()
+    normalized = []
+    in_ports = False
+    ports_indent = 0
+    changed = False
+
+    for line in lines:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+
+        if in_ports and stripped and indent <= ports_indent and not stripped.startswith("-"):
+            in_ports = False
+
+        if stripped == "ports:":
+            normalized.append(line.replace("ports:", "expose:", 1))
+            in_ports = True
+            ports_indent = indent
+            changed = True
+            continue
+
+        if in_ports and stripped.startswith("-"):
+            value = stripped[1:].strip().strip("'\"")
+            if ":" in value:
+                value = value.split(":")[-1]
+                changed = True
+            value = value.split("/")[0]
+            normalized.append(f"{' ' * indent}- \"{value}\"")
+            continue
+
+        normalized.append(line)
+
+    return "\n".join(normalized) + ("\n" if compose_content.endswith("\n") else ""), changed
 
 # 配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -287,6 +368,130 @@ class SSHClient:
         finally:
             sftp.close()
         return True, ""
+
+    def write_remote_text(self, remote_path, content):
+        """Write a UTF-8 text file over SFTP, creating parent directories first."""
+        if not self.client:
+            return False, "SSH 未连接"
+        sftp = self.client.open_sftp()
+        try:
+            remote_parent = remote_path.replace("\\", "/").rsplit("/", 1)[0]
+            if remote_parent:
+                self._ensure_remote_dir(sftp, remote_parent)
+            with sftp.file(remote_path, "w") as f:
+                f.write(content)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+        finally:
+            sftp.close()
+
+    def ensure_path_gateway(self, project_slug, container_name, target_port, public_domain):
+        """Create/update the shared HTTPS gateway route for a deployed container."""
+        gateway_root = "/opt/aigenimage-gateway"
+        gateway_network = "aigenimage_gateway"
+        gateway_name = "aigenimage-gateway"
+        route_path = f"/{project_slug}"
+        domain, server_names, cert_base = gateway_domain_values(public_domain)
+
+        for path in (gateway_root, f"{gateway_root}/conf.d", f"{gateway_root}/routes"):
+            ok, _, error = self.prepare_remote_dir(path)
+            if not ok:
+                return False, f"无法准备网关目录 {path}: {error}"
+
+        main_conf = f"""server {{
+    listen 80;
+    server_name {server_names};
+    return 301 https://$host$request_uri;
+}}
+
+server {{
+    listen 443 ssl;
+    server_name {server_names};
+
+    ssl_certificate /etc/nginx/ssl/{cert_base}_bundle.crt;
+    ssl_certificate_key /etc/nginx/ssl/{cert_base}.key;
+
+    client_max_body_size 100m;
+
+    include /etc/nginx/routes/*.conf;
+
+    location = / {{
+        default_type text/plain;
+        return 200 "aigenimage deployment gateway\\n";
+    }}
+}}
+"""
+        route_conf = f"""location = {route_path} {{
+    return 301 {route_path}/;
+}}
+
+location {route_path}/ {{
+    proxy_pass http://{container_name}:{target_port};
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Prefix {route_path};
+    proxy_redirect off;
+    proxy_buffering off;
+    proxy_connect_timeout 60s;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+}}
+"""
+
+        for remote_path, content in (
+            (f"{gateway_root}/conf.d/default.conf", main_conf),
+            (f"{gateway_root}/routes/{project_slug}.conf", route_conf),
+        ):
+            ok, error = self.write_remote_text(remote_path, content)
+            if not ok:
+                return False, f"写入网关配置失败 {remote_path}: {error}"
+
+        container_q = shlex.quote(container_name)
+        network_q = shlex.quote(gateway_network)
+        self.exec_command(f"docker network create {network_q} >/dev/null 2>&1 || true", timeout=30)
+        self.exec_command(
+            f"docker network inspect {network_q} --format '{{{{range .Containers}}}}{{{{.Name}}}} {{{{end}}}}' "
+            f"| grep -qw {container_q} || docker network connect {network_q} {container_q}",
+            timeout=30,
+        )
+
+        test_cmd = (
+            f"docker run --rm --network {network_q} "
+            f"-v {gateway_root}/conf.d:/etc/nginx/conf.d:ro "
+            f"-v {gateway_root}/routes:/etc/nginx/routes:ro "
+            f"-v /etc/nginx/ssl:/etc/nginx/ssl:ro "
+            "nginx:latest nginx -t"
+        )
+        rc, out, err = self.exec_command(test_cmd, timeout=60)
+        if rc != 0:
+            return False, f"Nginx 配置校验失败: {err or out}"
+
+        exists_cmd = f"docker ps -a --format '{{{{.Names}}}}' | grep -Fx {shlex.quote(gateway_name)}"
+        rc, _, _ = self.exec_command(exists_cmd, timeout=10)
+        if rc == 0:
+            reload_cmd = f"docker exec {gateway_name} nginx -t && docker exec {gateway_name} nginx -s reload"
+            rc, out, err = self.exec_command(reload_cmd, timeout=30)
+            if rc != 0:
+                return False, f"网关重载失败: {err or out}"
+        else:
+            run_cmd = (
+                f"docker run -d --name {gateway_name} --restart unless-stopped "
+                f"--network {network_q} "
+                "-p 80:80 -p 443:443 "
+                f"-v {gateway_root}/conf.d:/etc/nginx/conf.d:ro "
+                f"-v {gateway_root}/routes:/etc/nginx/routes:ro "
+                "-v /etc/nginx/ssl:/etc/nginx/ssl:ro "
+                "nginx:latest"
+            )
+            rc, out, err = self.exec_command(run_cmd, timeout=60)
+            if rc != 0:
+                return False, f"网关启动失败: {err or out}"
+
+        return True, f"https://{domain}/{project_slug}/"
 
     def close(self):
         """关闭连接"""
@@ -568,6 +773,9 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
     user = data.get("user", "")
     password = data.get("password", "")
     key_path = data.get("key_path", "")
+    config = load_config()
+    settings = config.get("settings", {})
+    public_domain = normalize_public_domain(data.get("public_domain") or settings.get("public_domain") or settings.get("domain"))
 
     ssh = None
 
@@ -631,6 +839,7 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         set_progress(40, "创建远程目录...")
         remote_dir = f"{server_path}/{module_name}"
         remote_dir_q = shlex.quote(remote_dir)
+        project_slug = slugify_project_name(os.path.basename(source_path))
         ok, create_mode, create_error = ssh.prepare_remote_dir(remote_dir)
         if not ok:
             log_message(f"创建远程目录失败: {create_error}", "error")
@@ -677,7 +886,11 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # Step 6: 写入 docker-compose.yml (80%)
         set_progress(80, "生成部署配置...")
         compose_content = data.get("docker_compose", "")
+        fallback_container_port = extract_first_container_port(compose_content)
         if compose_content:
+            compose_content, ports_changed = normalize_compose_for_path_gateway(compose_content)
+            if ports_changed:
+                log_message("已切换为路径网关模式：移除宿主机端口映射，改用容器内部 expose")
             # 通过 SFTP 写入文件
             sftp = ssh.client.open_sftp()
             with sftp.file(f"{remote_dir}/docker-compose.yml", "w") as f:
@@ -722,6 +935,42 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             set_progress(0, "容器启动失败")
             log_message(f"容器启动失败: {err or out}", "error")
             return
+
+        rc, container_id, err = ssh.exec_command(
+            f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml ps -q | head -n 1",
+            timeout=30,
+        )
+        container_id = container_id.strip()
+        if rc != 0 or not container_id:
+            set_progress(0, "容器信息获取失败")
+            log_message(f"容器信息获取失败: {err}", "error")
+            return
+
+        inspect_cmd = (
+            "docker inspect --format '{{.Name}} {{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "
+            f"{shlex.quote(container_id)}"
+        )
+        rc, inspect_out, inspect_err = ssh.exec_command(inspect_cmd, timeout=30)
+        if rc != 0:
+            set_progress(0, "容器信息获取失败")
+            log_message(f"容器信息获取失败: {inspect_err}", "error")
+            return
+
+        inspect_parts = inspect_out.strip().split()
+        container_name = inspect_parts[0].lstrip("/") if inspect_parts else ""
+        exposed_ports = [part.split("/")[0] for part in inspect_parts[1:] if "/" in part]
+        target_port = exposed_ports[0] if exposed_ports else fallback_container_port
+        if not container_name or not target_port:
+            set_progress(0, "路径网关配置失败")
+            log_message("路径网关配置失败: 无法识别容器名或内部端口", "error")
+            return
+
+        ok, gateway_result = ssh.ensure_path_gateway(project_slug, container_name, target_port, public_domain)
+        if not ok:
+            set_progress(0, "路径网关配置失败")
+            log_message(f"路径网关配置失败: {gateway_result}", "error")
+            return
+        log_message(f"访问地址: {gateway_result}")
 
         # Step 8: 显示状态 (100%)
         set_progress(100, "部署完成！")
