@@ -67,13 +67,14 @@ def extract_first_container_port(compose_content):
     return ""
 
 
-def normalize_compose_for_path_gateway(compose_content):
+def normalize_compose_for_path_gateway(compose_content, project_slug=None):
     """Convert host port mappings to internal expose entries for path-based gateway routing."""
     lines = compose_content.splitlines()
     normalized = []
     in_ports = False
     ports_indent = 0
     changed = False
+    env_inserted = "PUBLIC_BASE_PATH" in compose_content
 
     for line in lines:
         stripped = line.strip()
@@ -89,6 +90,18 @@ def normalize_compose_for_path_gateway(compose_content):
             changed = True
             continue
 
+        if project_slug and stripped.startswith("container_name:"):
+            normalized.append(f"{' ' * indent}container_name: {project_slug}-app")
+            changed = True
+            continue
+
+        if project_slug and stripped == "environment:" and not env_inserted:
+            normalized.append(line)
+            normalized.append(f"{' ' * (indent + 2)}- PUBLIC_BASE_PATH=/{project_slug}")
+            env_inserted = True
+            changed = True
+            continue
+
         if in_ports and stripped.startswith("-"):
             value = stripped[1:].strip().strip("'\"")
             if ":" in value:
@@ -101,6 +114,32 @@ def normalize_compose_for_path_gateway(compose_content):
         normalized.append(line)
 
     return "\n".join(normalized) + ("\n" if compose_content.endswith("\n") else ""), changed
+
+
+def normalize_dockerfile_for_python_gateway(dockerfile_content):
+    """Ensure common Python/gunicorn templates contain the runtime they start."""
+    if 'CMD ["gunicorn"' not in dockerfile_content and "CMD ['gunicorn'" not in dockerfile_content:
+        return dockerfile_content, False
+
+    changed = False
+    lines = []
+    pip_env_inserted = "PIP_INDEX_URL" in dockerfile_content
+    for line in dockerfile_content.splitlines():
+        lines.append(line)
+        if not pip_env_inserted and line.strip().startswith("WORKDIR "):
+            lines.append("")
+            lines.append("ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \\")
+            lines.append("    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn")
+            pip_env_inserted = True
+            changed = True
+            continue
+
+        stripped = line.strip()
+        if stripped.startswith("RUN pip install") and "-r requirements.txt" in stripped and "gunicorn" not in stripped:
+            lines[-1] = line.rstrip() + " gunicorn"
+            changed = True
+
+    return "\n".join(lines) + ("\n" if dockerfile_content.endswith("\n") else ""), changed
 
 # 配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -888,7 +927,7 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         compose_content = data.get("docker_compose", "")
         fallback_container_port = extract_first_container_port(compose_content)
         if compose_content:
-            compose_content, ports_changed = normalize_compose_for_path_gateway(compose_content)
+            compose_content, ports_changed = normalize_compose_for_path_gateway(compose_content, project_slug)
             if ports_changed:
                 log_message("已切换为路径网关模式：移除宿主机端口映射，改用容器内部 expose")
             # 通过 SFTP 写入文件
@@ -900,6 +939,9 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # 写入 Dockerfile
         dockerfile_content = data.get("dockerfile", "")
         if dockerfile_content:
+            dockerfile_content, dockerfile_changed = normalize_dockerfile_for_python_gateway(dockerfile_content)
+            if dockerfile_changed:
+                log_message("已为 Python gunicorn 模板补充 gunicorn 依赖")
             sftp = ssh.client.open_sftp()
             with sftp.file(f"{remote_dir}/Dockerfile", "w") as f:
                 f.write(dockerfile_content)
