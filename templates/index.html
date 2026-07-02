@@ -489,7 +489,10 @@
                 </div>
                 <div class="form-group">
                     <label>本地项目目录</label>
-                    <input type="text" id="modSourcePath" placeholder="选择或输入本地项目路径">
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <input type="text" id="modSourcePath" placeholder="选择或输入本地项目路径" style="flex:1;">
+                        <button class="btn btn-outline btn-sm" id="openModuleAccessUrlBtn" onclick="openModuleAccessUrl()" style="white-space:nowrap;" disabled> 打开网址</button>
+                    </div>
                     <div class="btn-group" style="margin-top:8px;">
                         <button class="btn btn-outline btn-sm" onclick="openPathBrowser()">📁 浏览目录</button>
                         <button class="btn btn-outline btn-sm" onclick="detectProjectType()">🔍 自动检测项目类型</button>
@@ -606,7 +609,7 @@
                 部署控制台
             </div>
 
-            <div class="form-row-3">
+            <div class="form-row">
                 <div class="form-group">
                     <label>选择服务器</label>
                     <select id="deployServer">
@@ -619,9 +622,12 @@
                         <option value="">-- 选择模块 --</option>
                     </select>
                 </div>
-                <div class="form-group">
-                    <label>本地项目目录</label>
-                    <input type="text" id="deploySourcePath" placeholder="选择或输入本地项目路径">
+            </div>
+            <div class="form-group">
+                <label>本地项目目录</label>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <input type="text" id="deploySourcePath" placeholder="选择或输入本地项目路径" style="flex:1;">
+                    <button class="btn btn-outline btn-sm" id="openAccessUrlBtn" onclick="openAccessUrl()" style="white-space:nowrap;" disabled>🔗 打开网址</button>
                 </div>
             </div>
 
@@ -1272,6 +1278,10 @@ networks:
                 selectProjectType(mod.project_type);
             }
 
+            // 更新模块表单的访问地址按钮状态
+            const modBtn = document.getElementById('openModuleAccessUrlBtn');
+            if (modBtn) modBtn.disabled = !mod.server_path;
+
             document.querySelector('[data-tab="module-form"]').click();
             showToast(`已选择模块: ${name}`);
         }
@@ -1386,11 +1396,15 @@ networks:
 
             moduleSelect.onchange = () => {
                 const mod = config.modules.find(m => m.name === moduleSelect.value);
+                const btn = document.getElementById('openAccessUrlBtn');
                 if (mod) {
                     document.getElementById('deploySourcePath').value = mod.source_path;
                     if (mod.project_type) {
                         selectProjectType(mod.project_type);
                     }
+                    btn.disabled = !mod.server_path;
+                } else {
+                    btn.disabled = true;
                 }
             };
         }
@@ -1498,9 +1512,50 @@ networks:
         }
 
         // ========================
+        //  打开部署访问地址
+        // ========================
+        function openAccessUrl() {
+            const moduleSelect = document.getElementById('deployModule');
+            const domain = normalizeDomain(document.getElementById('publicDomain').value);
+            if (!moduleSelect.value) {
+                showToast('请先选择一个模块', 'error');
+                return;
+            }
+            const mod = config.modules.find(m => m.name === moduleSelect.value);
+            if (!mod || !mod.server_path) {
+                showToast('模块未配置远程路径', 'error');
+                return;
+            }
+            window.open(`https://${domain}/${mod.server_path}/`, '_blank');
+        }
+
+        // ========================
+        //  打开模块访问地址
+        // ========================
+        function openModuleAccessUrl() {
+            const serverPath = document.getElementById('modServerPath').value.trim();
+            const domain = normalizeDomain(document.getElementById('publicDomain').value);
+            if (!serverPath) {
+                showToast('请先填写远程子路径', 'error');
+                return;
+            }
+            window.open(`https://${domain}/${serverPath}/`, '_blank');
+        }
+
+        // ========================
         //  初始化
         // ========================
         document.getElementById('publicDomain').addEventListener('input', updateUrlPreview);
+
+        // 模块表单：远程子路径变化时更新访问地址按钮状态
+        document.getElementById('modServerPath').addEventListener('input', function () {
+            const btn = document.getElementById('openModuleAccessUrlBtn');
+            if (btn) btn.disabled = !this.value.trim();
+        });
+        // 初始状态：modServerPath 默认值为 "web"
+        const initModBtn = document.getElementById('openModuleAccessUrlBtn');
+        if (initModBtn) initModBtn.disabled = !document.getElementById('modServerPath').value.trim();
+
         loadConfig();
     </script>
 </body>
