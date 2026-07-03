@@ -142,6 +142,69 @@ def normalize_dockerfile_for_python_gateway(dockerfile_content):
     return "\n".join(lines) + ("\n" if dockerfile_content.endswith("\n") else ""), changed
 
 # 配置
+def normalize_dockerfile_for_node_package(dockerfile_content, source_path):
+    """Adjust generic Node Dockerfiles to the scripts declared by package.json."""
+    lowered = dockerfile_content.lower()
+    if "npm " not in lowered and "package" not in lowered and "node:" not in lowered:
+        return dockerfile_content, []
+
+    package_path = os.path.join(source_path, "package.json")
+    if not os.path.isfile(package_path):
+        return dockerfile_content, []
+
+    try:
+        with open(package_path, "r", encoding="utf-8") as f:
+            package_data = json.load(f)
+    except Exception:
+        return dockerfile_content, []
+
+    scripts = package_data.get("scripts") if isinstance(package_data, dict) else {}
+    scripts = scripts if isinstance(scripts, dict) else {}
+    has_build = bool(str(scripts.get("build", "")).strip())
+    has_start = bool(str(scripts.get("start", "")).strip())
+    main_entry = package_data.get("main") if isinstance(package_data, dict) else ""
+    main_entry = main_entry if isinstance(main_entry, str) and main_entry.strip() else "server.js"
+
+    lines = []
+    messages = []
+    removed_build = False
+    rewrote_cmd = False
+
+    for line in dockerfile_content.splitlines():
+        stripped = line.strip()
+        if not has_build and re.match(r"^RUN\s+(npm\s+run|yarn|pnpm)\s+build\b", stripped):
+            removed_build = True
+            continue
+
+        if stripped.startswith("CMD "):
+            command_looks_like_node_entry = (
+                "dist/index.js" in stripped
+                or "server.js" in stripped
+                or re.search(r"['\"]node['\"]", stripped) is not None
+            )
+            if has_start and command_looks_like_node_entry and stripped != 'CMD ["npm", "start"]':
+                indent = line[: len(line) - len(line.lstrip(" "))]
+                lines.append(f'{indent}CMD ["npm", "start"]')
+                rewrote_cmd = True
+                continue
+            if not has_start and "dist/index.js" in stripped and main_entry:
+                indent = line[: len(line) - len(line.lstrip(" "))]
+                lines.append(f'{indent}CMD ["node", "{main_entry}"]')
+                rewrote_cmd = True
+                continue
+
+        lines.append(line)
+
+    if removed_build:
+        messages.append("已根据 package.json 移除缺失的 npm run build 构建步骤")
+    if rewrote_cmd and has_start:
+        messages.append("已根据 package.json 改用 npm start 启动 Node 服务")
+    elif rewrote_cmd:
+        messages.append(f"已根据 package.json main 字段改用 node {main_entry} 启动 Node 服务")
+
+    return "\n".join(lines) + ("\n" if dockerfile_content.endswith("\n") else ""), messages
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "deploy_config.json")
 DEPLOY_LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -547,7 +610,12 @@ location {route_path}/ {{
 @app.route("/")
 def index():
     """主页"""
-    return render_template("index.html")
+    response = render_template("index.html")
+    resp = app.make_response(response)
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/api/config", methods=["GET"])
@@ -939,6 +1007,9 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # 写入 Dockerfile
         dockerfile_content = data.get("dockerfile", "")
         if dockerfile_content:
+            dockerfile_content, node_messages = normalize_dockerfile_for_node_package(dockerfile_content, source_path)
+            for message in node_messages:
+                log_message(message)
             dockerfile_content, dockerfile_changed = normalize_dockerfile_for_python_gateway(dockerfile_content)
             if dockerfile_changed:
                 log_message("已为 Python gunicorn 模板补充 gunicorn 依赖")
