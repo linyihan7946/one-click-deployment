@@ -1018,13 +1018,22 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
                 f.write(dockerfile_content)
             log_message("Dockerfile 已写入")
 
+        # 写入 .env 文件（环境变量）
+        env_vars_content = data.get("env_vars", "").strip()
+        if env_vars_content:
+            sftp = ssh.client.open_sftp()
+            with sftp.file(f"{remote_dir}/.env", "w") as f:
+                f.write(env_vars_content)
+            log_message(".env 环境变量文件已写入")
+
         # Step 7: 远程 Docker 部署 (90%)
         set_progress(90, "远程构建和部署...")
+        compose_project_flag = f"-p {shlex.quote(project_slug)}"
         log_message("执行 docker compose pull...")
-        ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml pull", timeout=120)
+        ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml pull", timeout=120)
 
         log_message("执行 docker compose build...")
-        rc, out, err = ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml build", timeout=600)
+        rc, out, err = ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml build", timeout=600)
         if out:
             for line in out.strip().split("\n"):
                 if line.strip():
@@ -1040,7 +1049,7 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
 
         log_message("执行 docker compose up -d...")
         rc, out, err = ssh.exec_command(
-            f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml up -d --remove-orphans", timeout=120
+            f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml up -d --remove-orphans", timeout=120
         )
         if rc == 0:
             log_message("容器启动成功！")
@@ -1050,7 +1059,7 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             return
 
         rc, container_id, err = ssh.exec_command(
-            f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml ps -q | head -n 1",
+            f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml ps -q | head -n 1",
             timeout=30,
         )
         container_id = container_id.strip()
@@ -1088,7 +1097,7 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # Step 8: 显示状态 (100%)
         set_progress(100, "部署完成！")
         log_message("获取容器状态...")
-        rc, out, err = ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} -f docker-compose.yml ps")
+        rc, out, err = ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml ps")
         if out:
             for line in out.strip().split("\n"):
                 if line.strip():
