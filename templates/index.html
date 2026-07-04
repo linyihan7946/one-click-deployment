@@ -1051,6 +1051,10 @@ networks:
                 .toLowerCase() || 'www.aigenimage.cn';
         }
 
+        function getAccessScheme(domain) {
+            return /^(\d{1,3}\.){3}\d{1,3}$/.test(domain) ? 'http' : 'https';
+        }
+
         function renderSettings() {
             const settings = config.settings || {};
             const domain = normalizeDomain(settings.public_domain || settings.domain || 'www.aigenimage.cn');
@@ -1061,7 +1065,7 @@ networks:
 
         function updateUrlPreview() {
             const domain = normalizeDomain(document.getElementById('publicDomain').value);
-            document.getElementById('urlPreview').value = `https://${domain}/项目名/`;
+            document.getElementById('urlPreview').value = `${getAccessScheme(domain)}://${domain}/项目名/`;
         }
 
         async function saveSettings() {
@@ -1518,7 +1522,7 @@ networks:
                 showToast('模块未配置远程路径', 'error');
                 return;
             }
-            window.open(`https://${domain}/${mod.server_path}/`, '_blank');
+            window.open(`${getAccessScheme(domain)}://${domain}/${mod.server_path}/`, '_blank');
         }
 
         // ========================
@@ -1531,7 +1535,7 @@ networks:
                 showToast('请先填写远程子路径', 'error');
                 return;
             }
-            window.open(`https://${domain}/${serverPath}/`, '_blank');
+            window.open(`${getAccessScheme(domain)}://${domain}/${serverPath}/`, '_blank');
         }
 
         // ========================

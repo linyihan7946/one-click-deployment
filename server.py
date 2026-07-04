@@ -15,6 +15,7 @@ import base64
 import time
 import io
 import fnmatch
+import ipaddress
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify
 
@@ -37,9 +38,20 @@ def normalize_public_domain(value):
     return domain or "www.aigenimage.cn"
 
 
+def is_ip_address(value):
+    """Return True when the public host is an IPv4 or IPv6 address."""
+    try:
+        ipaddress.ip_address(normalize_public_domain(value))
+        return True
+    except ValueError:
+        return False
+
+
 def gateway_domain_values(domain):
     """Return server_name and certificate basename for a public domain."""
     domain = normalize_public_domain(domain)
+    if is_ip_address(domain):
+        return domain, domain, domain
     if domain.startswith("www."):
         apex = domain[4:]
         server_names = f"{domain} {apex}"
@@ -495,13 +507,15 @@ class SSHClient:
         gateway_name = "aigenimage-gateway"
         route_path = f"/{project_slug}"
         domain, server_names, cert_base = gateway_domain_values(public_domain)
+        use_https = not is_ip_address(domain)
 
         for path in (gateway_root, f"{gateway_root}/conf.d", f"{gateway_root}/routes"):
             ok, _, error = self.prepare_remote_dir(path)
             if not ok:
                 return False, f"无法准备网关目录 {path}: {error}"
 
-        main_conf = f"""server {{
+        if use_https:
+            main_conf = f"""server {{
     listen 80;
     server_name {server_names};
     return 301 https://$host$request_uri;
@@ -524,6 +538,23 @@ server {{
     }}
 }}
 """
+            access_url = f"https://{domain}/{project_slug}/"
+        else:
+            main_conf = f"""server {{
+    listen 80;
+    server_name {server_names};
+
+    client_max_body_size 100m;
+
+    include /etc/nginx/routes/*.conf;
+
+    location = / {{
+        default_type text/plain;
+        return 200 "aigenimage deployment gateway\\n";
+    }}
+}}
+"""
+            access_url = f"http://{domain}/{project_slug}/"
         route_conf = f"""location = {route_path} {{
     return 301 {route_path}/;
 }}
@@ -593,7 +624,7 @@ location {route_path}/ {{
             if rc != 0:
                 return False, f"网关启动失败: {err or out}"
 
-        return True, f"https://{domain}/{project_slug}/"
+        return True, access_url
 
     def close(self):
         """关闭连接"""
@@ -1048,9 +1079,35 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             return
 
         log_message("执行 docker compose up -d...")
+        expected_container_name = f"{project_slug}-app"
+        expected_container_q = shlex.quote(expected_container_name)
+        cleanup_conflict_cmd = (
+            "existing_id=$(docker ps -aq --filter "
+            f"{shlex.quote(f'name=^/{expected_container_name}$')} | head -n 1); "
+            "if [ -n \"$existing_id\" ]; then "
+            "existing_project=$(docker inspect -f '{{ index .Config.Labels \"com.docker.compose.project\" }}' \"$existing_id\" 2>/dev/null || true); "
+            f"if [ \"$existing_project\" != {shlex.quote(project_slug)} ]; then "
+            "docker rm -f \"$existing_id\" >/dev/null && "
+            f"echo removed:{expected_container_q}:$existing_project; "
+            "fi; "
+            "fi"
+        )
+        rc, cleanup_out, cleanup_err = ssh.exec_command(cleanup_conflict_cmd, timeout=60)
+        if cleanup_out.strip():
+            log_message(f"已清理历史同名容器: {cleanup_out.strip()}", "warn")
+        if rc != 0 and cleanup_err.strip():
+            log_message(f"历史同名容器检查失败，将继续尝试启动: {cleanup_err.strip()}", "warn")
+
         rc, out, err = ssh.exec_command(
             f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml up -d --remove-orphans", timeout=120
         )
+        if rc != 0 and "is already in use" in (err or out):
+            log_message(f"检测到同名容器冲突，正在移除 {expected_container_name} 后重试...", "warn")
+            ssh.exec_command(f"docker rm -f {expected_container_q}", timeout=60)
+            rc, out, err = ssh.exec_command(
+                f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml up -d --remove-orphans",
+                timeout=120,
+            )
         if rc == 0:
             log_message("容器启动成功！")
         else:
