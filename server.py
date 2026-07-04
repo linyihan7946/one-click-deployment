@@ -217,6 +217,176 @@ def normalize_dockerfile_for_node_package(dockerfile_content, source_path):
     return "\n".join(lines) + ("\n" if dockerfile_content.endswith("\n") else ""), messages
 
 
+def detect_project_type_for_path(path):
+    """Return a project type and detection reason for a local source directory."""
+    if not path or not os.path.isdir(path):
+        return "", "invalid source directory"
+
+    try:
+        files = {item.lower() for item in os.listdir(path)}
+    except Exception as exc:
+        return "", str(exc)
+
+    if any(name in files for name in ("requirements.txt", "pyproject.toml", "pipfile", "pipfile.lock")):
+        return "python", "found Python dependency file"
+    if any(name in files for name in ("setup.py", "manage.py", "app.py", "main.py", "wsgi.py", "asgi.py")):
+        return "python", "found Python entrypoint"
+    if any(name in files for name in ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")):
+        return "java", "found Java build file"
+    if "go.mod" in files:
+        return "go", "found go.mod"
+    if any(name.endswith(".csproj") or name.endswith(".sln") for name in files):
+        return "dotnet", "found .NET project file"
+    if "composer.json" in files:
+        return "php", "found composer.json"
+    if "package.json" in files:
+        try:
+            with open(os.path.join(path, "package.json"), "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            deps = {}
+            deps.update(pkg.get("dependencies", {}))
+            deps.update(pkg.get("devDependencies", {}))
+            if any(dep in deps for dep in ("vue", "@vue/cli-service", "react", "react-dom", "next", "nuxt")):
+                return "vue", "found frontend dependency"
+        except Exception:
+            pass
+        return "nodejs", "found package.json"
+    if "index.html" in files:
+        return "static", "found index.html"
+    return "", "no known project marker"
+
+
+def default_deploy_templates(project_type, port=None):
+    """Return fallback docker-compose and Dockerfile content for a project type."""
+    defaults = {
+        "python": (8000, "app-python"),
+        "nodejs": (3000, "app-nodejs"),
+        "vue": (80, "app-frontend"),
+        "java": (8080, "app-java"),
+        "go": (8080, "app-go"),
+        "php": (80, "app-php"),
+        "dotnet": (8080, "app-dotnet"),
+        "static": (80, "app-static"),
+    }
+    default_port, container_name = defaults.get(project_type or "", (3000, "app-web"))
+    try:
+        port = int(port or default_port)
+    except (TypeError, ValueError):
+        port = default_port
+
+    compose = f"""services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: {container_name}
+    restart: unless-stopped
+    ports:
+      - "{port}:{port}"
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+"""
+
+    dockerfiles = {
+        "python": f"""FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \\
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt gunicorn
+
+COPY . .
+
+EXPOSE {port}
+
+CMD ["gunicorn", "-b", "0.0.0.0:{port}", "app:app"]
+""",
+        "nodejs": f"""FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --production=false
+
+COPY . .
+
+EXPOSE {port}
+
+CMD ["npm", "start"]
+""",
+        "vue": """FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+""",
+        "static": """FROM nginx:alpine
+
+COPY . /usr/share/nginx/html
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+""",
+        "php": """FROM php:8.3-apache
+
+WORKDIR /var/www/html
+COPY . .
+RUN docker-php-ext-install pdo_mysql mysqli
+EXPOSE 80
+""",
+        "go": """FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server ./main.go
+
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/server .
+EXPOSE 8080
+CMD ["./server"]
+""",
+        "java": """FROM eclipse-temurin:21-jdk-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN apk add --no-cache maven && mvn clean package -DskipTests
+
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+COPY --from=builder /app/target/*.jar app.jar
+EXPOSE 8080
+CMD ["java", "-jar", "app.jar"]
+""",
+        "dotnet": """FROM mcr.microsoft.com/dotnet/sdk:8.0 AS builder
+WORKDIR /src
+COPY . .
+RUN dotnet publish -c Release -o /app/publish
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+WORKDIR /app
+COPY --from=builder /app/publish .
+EXPOSE 8080
+ENV ASPNETCORE_URLS=http://+:8080
+ENTRYPOINT ["dotnet", "YourProject.dll"]
+""",
+    }
+    return compose, dockerfiles.get(project_type or "", dockerfiles["nodejs"])
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "deploy_config.json")
 DEPLOY_LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -283,15 +453,21 @@ class SSHClient:
             "port": self.port,
             "username": self.user,
             "timeout": timeout,
-            "allow_agent": True,
-            "look_for_keys": True,
+            "allow_agent": False,
+            "look_for_keys": False,
         }
 
         # 优先使用密钥
-        if self.key_path and os.path.exists(os.path.expanduser(self.key_path)):
-            connect_kwargs["key_filename"] = os.path.expanduser(self.key_path)
-        elif self.password:
+        expanded_key_path = os.path.expanduser(self.key_path) if self.key_path else ""
+        has_key_path = bool(expanded_key_path and os.path.exists(expanded_key_path))
+
+        if has_key_path:
+            connect_kwargs["key_filename"] = expanded_key_path
+        if self.password:
             connect_kwargs["password"] = self.password
+        if not has_key_path and not self.password:
+            connect_kwargs["allow_agent"] = True
+            connect_kwargs["look_for_keys"] = True
 
         self.client.connect(**connect_kwargs)
         return True
@@ -673,7 +849,7 @@ def add_server():
     found = False
     for i, srv in enumerate(config["servers"]):
         if srv.get("name") == data.get("name"):
-            if not data.get("password") and srv.get("password"):
+            if data.get("password") in ("", "***", None) and srv.get("password"):
                 data["password"] = srv["password"]
             config["servers"][i] = data
             found = True
@@ -846,11 +1022,22 @@ def detect_project_type():
 def test_ssh():
     """测试 SSH 连接（使用 paramiko）"""
     data = request.json
+    name = data.get("name", "")
     host = data.get("host", "")
     port = data.get("port", 22)
     user = data.get("user", "")
     password = data.get("password", "")
     key_path = data.get("key_path", "")
+
+    if name and password in ("", "***", None):
+        config = load_config()
+        server_config = next((s for s in config.get("servers", []) if s.get("name") == name), None)
+        if server_config:
+            host = server_config.get("host", host)
+            port = server_config.get("port", port)
+            user = server_config.get("user", user)
+            password = server_config.get("password", password)
+            key_path = server_config.get("key_path", key_path)
 
     if not host or not user:
         return jsonify({"success": False, "message": "主机和用户名不能为空"})
@@ -888,6 +1075,16 @@ def deploy():
         if not all([server_name, module_name, source_path, server_path]):
             return jsonify({"success": False, "message": "请填写完整的部署信息"})
 
+        config = load_config()
+        server_config = next((s for s in config.get("servers", []) if s.get("name") == server_name), None)
+        if not server_config:
+            return jsonify({"success": False, "message": "服务器配置不存在"})
+
+        deploy_data = dict(data)
+        for field in ("host", "port", "user", "password", "key_path"):
+            deploy_data[field] = server_config.get(field, "")
+        deploy_data["server_path"] = server_config.get("deploy_path") or server_path
+
         deploy_status["running"] = True
         deploy_status["progress"] = 0
         deploy_status["message"] = "准备部署..."
@@ -896,7 +1093,7 @@ def deploy():
 
         thread = threading.Thread(
             target=run_deploy,
-            args=(server_name, module_name, source_path, server_path, data),
+            args=(server_name, module_name, source_path, deploy_data["server_path"], deploy_data),
         )
         thread.daemon = True
         thread.start()
@@ -1023,7 +1220,24 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
 
         # Step 6: 写入 docker-compose.yml (80%)
         set_progress(80, "生成部署配置...")
+        module_config = next((m for m in config.get("modules", []) if m.get("name") == module_name), {})
+        project_type = (data.get("project_type") or module_config.get("project_type") or "").strip()
+        if not project_type:
+            project_type, detect_reason = detect_project_type_for_path(source_path)
+            if project_type:
+                log_message(f"自动识别项目类型: {project_type} ({detect_reason})")
+
         compose_content = data.get("docker_compose", "")
+        dockerfile_content = data.get("dockerfile", "")
+        if not compose_content or not dockerfile_content:
+            default_compose, default_dockerfile = default_deploy_templates(project_type, module_config.get("port"))
+            if not compose_content:
+                compose_content = default_compose
+                log_message("未收到 docker-compose.yml 内容，已使用默认模板", "warn")
+            if not dockerfile_content:
+                dockerfile_content = default_dockerfile
+                log_message("未收到 Dockerfile 内容，已使用默认模板", "warn")
+
         fallback_container_port = extract_first_container_port(compose_content)
         if compose_content:
             compose_content, ports_changed = normalize_compose_for_path_gateway(compose_content, project_slug)
@@ -1036,7 +1250,6 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             log_message("docker-compose.yml 已写入")
 
         # 写入 Dockerfile
-        dockerfile_content = data.get("dockerfile", "")
         if dockerfile_content:
             dockerfile_content, node_messages = normalize_dockerfile_for_node_package(dockerfile_content, source_path)
             for message in node_messages:

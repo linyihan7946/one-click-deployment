@@ -1166,6 +1166,7 @@ networks:
 
         async function testSSH() {
             const data = {
+                name: document.getElementById('srvName').value.trim(),
                 host: document.getElementById('srvHost').value.trim(),
                 port: parseInt(document.getElementById('srvPort').value) || 22,
                 user: document.getElementById('srvUser').value.trim(),
