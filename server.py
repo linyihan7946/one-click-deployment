@@ -86,7 +86,11 @@ def normalize_compose_for_path_gateway(compose_content, project_slug=None):
     in_ports = False
     ports_indent = 0
     changed = False
-    env_inserted = "PUBLIC_BASE_PATH" in compose_content
+    required_env = []
+    if project_slug:
+        for key in ("PUBLIC_BASE_PATH", "SCRIPT_NAME"):
+            if f"{key}=" not in compose_content:
+                required_env.append(f"{key}=/{project_slug}")
 
     for line in lines:
         stripped = line.strip()
@@ -107,12 +111,20 @@ def normalize_compose_for_path_gateway(compose_content, project_slug=None):
             changed = True
             continue
 
-        if project_slug and stripped == "environment:" and not env_inserted:
+        if project_slug and stripped == "environment:" and required_env:
             normalized.append(line)
-            normalized.append(f"{' ' * (indent + 2)}- PUBLIC_BASE_PATH=/{project_slug}")
-            env_inserted = True
+            for item in required_env:
+                normalized.append(f"{' ' * (indent + 2)}- {item}")
+            required_env = []
             changed = True
             continue
+
+        if project_slug and stripped == "networks:" and indent > 0 and required_env:
+            normalized.append(f"{' ' * indent}environment:")
+            for item in required_env:
+                normalized.append(f"{' ' * (indent + 2)}- {item}")
+            required_env = []
+            changed = True
 
         if in_ports and stripped.startswith("-"):
             value = stripped[1:].strip().strip("'\"")
@@ -124,6 +136,12 @@ def normalize_compose_for_path_gateway(compose_content, project_slug=None):
             continue
 
         normalized.append(line)
+
+    if project_slug and required_env:
+        normalized.append("    environment:")
+        for item in required_env:
+            normalized.append(f"      - {item}")
+        changed = True
 
     return "\n".join(normalized) + ("\n" if compose_content.endswith("\n") else ""), changed
 
