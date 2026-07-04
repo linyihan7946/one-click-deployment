@@ -39,6 +39,52 @@ cd e:\GitHubWorkSpace\one-click-deployment
 
 编辑项目根目录的 `docker-compose.yml`（或创建你自己的），定义你的服务。
 
+适合直接部署的项目:
+
+- 单体 Web 服务: Python/Node.js/Java/Go/PHP/.NET 等。
+- 前端静态站点: Vue/React/Vite/普通 HTML/CSS/JS。
+- 已经能用 `docker compose up` 在本地跑起来的项目。
+
+带数据库的项目建议项目自己维护 `docker-compose.yml`，不要完全依赖自动模板。例如:
+
+```yaml
+services:
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://app:change-me@db:5432/appdb
+    expose:
+      - "8000"
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=appdb
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=change-me
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db-data:
+```
+
+注意:
+
+- 数据库服务不要暴露公网端口，后端通过 `db:5432` 这类服务名连接。
+- 数据库必须使用 volume 持久化数据。
+- 密码和连接串不要提交到公共仓库，生产环境建议通过 `.env` 或部署环境变量提供。
+- 部署前先在本地执行 `docker compose up --build` 验证。
+
 ### 第三步: 一键部署
 
 ```powershell

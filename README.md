@@ -65,6 +65,79 @@
 .\deploy.ps1 -Action rollback      # 回滚部署
 ```
 
+## 适合部署的项目类型
+
+本工具适合把**已经可以用 Docker 运行的 Web 项目**同步到远程服务器，并通过 `docker compose up -d` 启动。推荐用于以下项目:
+
+- **单体 Web 服务**: Flask/FastAPI/Django、Express/Koa/NestJS、Spring Boot、Go Web、PHP、ASP.NET Core 等。
+- **前端静态站点**: Vue、React、Vite、Next.js 静态导出、普通 HTML/CSS/JS。
+- **前后端分离项目**: 前端、后端可作为不同模块分别部署，或由项目自带 `docker-compose.yml` 统一编排。
+- **带外部依赖的后端服务**: 数据库、Redis、对象存储等已经在云服务或其他服务器中运行，通过环境变量连接。
+
+需要谨慎处理的项目:
+
+- **后端 + 数据库 + Redis 等多服务项目**: 可以部署，但建议使用项目自己维护的 `docker-compose.yml`，不要完全依赖自动模板猜测。
+- **需要系统依赖的项目**: 例如 LibreOffice、ffmpeg、字体、Playwright/浏览器内核等，需要在项目 Dockerfile 中明确安装。
+- **部署到子路径的项目**: 例如访问 `/my-app/`，后端需要支持 `SCRIPT_NAME`、`PUBLIC_BASE_PATH` 或类似 base path 配置。
+- **生产数据库项目**: 不建议把数据库端口暴露到公网，数据库数据必须使用 Docker volume 或外部云数据库持久化。
+
+如果项目没有提供 Docker 配置，工具可以按项目类型生成基础模板；如果项目已经有 `Dockerfile` / `docker-compose.yml`，推荐优先使用项目自带配置。
+
+## 带数据库的项目怎么用
+
+带数据库的项目最可靠的方式是: **项目根目录自己提供一份部署用 `docker-compose.yml`，然后在部署页面粘贴或使用这份配置**。工具负责同步代码、写入远程配置、执行 `docker compose build/up` 和接入公网入口。
+
+示例: 后端服务 + PostgreSQL 数据库:
+
+```yaml
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://app:change-me@db:5432/appdb
+    expose:
+      - "8000"
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=appdb
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=change-me
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db-data:
+```
+
+使用建议:
+
+- **公网入口服务放在 compose 的主服务中**，通常命名为 `app`、`web` 或 `api`。
+- **应用服务使用 `expose` 声明内部端口**，由工具的网关转发访问；不建议直接写 `ports` 暴露应用端口。
+- **数据库服务不要暴露公网端口**，后端通过 Docker Compose 服务名访问，例如 `db:5432`、`mysql:3306`、`redis:6379`。
+- **数据库密码不要提交到公共仓库**，生产环境建议通过 `.env`、部署页面环境变量或服务器密钥管理提供。
+- **数据库数据必须挂载 volume**，例如 `db-data:/var/lib/postgresql/data`，否则容器重建可能丢数据。
+- **首次部署前先本地验证**: 在项目目录执行 `docker compose up --build`，确认服务、迁移、静态资源和健康检查都正常。
+- **迁移命令由项目自己处理**，例如在应用启动脚本里执行 `alembic upgrade head`、`prisma migrate deploy`、`python manage.py migrate` 等。
+
+对于已经使用云数据库的项目，不需要在 compose 里声明 `db` 服务，只要给后端配置正确连接串即可:
+
+```env
+DATABASE_URL=postgresql://user:password@your-db-host:5432/dbname
+REDIS_URL=redis://your-redis-host:6379/0
+```
+
 ## 配置说明
 
 ### 配置文件: `deploy-config.json`
