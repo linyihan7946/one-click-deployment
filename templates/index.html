@@ -1285,8 +1285,8 @@ networks:
         // ========================
         //  自动检测项目类型
         // ========================
-        async function detectProjectType() {
-            const path = document.getElementById('modSourcePath').value.trim();
+        async function detectProjectType(pathOverride = '') {
+            const path = (pathOverride || document.getElementById('modSourcePath').value).trim();
             if (!path) {
                 showToast('请先输入项目目录路径', 'error');
                 return;
@@ -1390,13 +1390,15 @@ networks:
             moduleSelect.innerHTML = '<option value="">-- 选择模块 --</option>' +
                 config.modules.map(m => `<option value="${m.name}">${m.name} (${m.source_path})</option>`).join('');
 
-            moduleSelect.onchange = () => {
+            moduleSelect.onchange = async () => {
                 const mod = config.modules.find(m => m.name === moduleSelect.value);
                 const btn = document.getElementById('openAccessUrlBtn');
                 if (mod) {
                     document.getElementById('deploySourcePath').value = mod.source_path;
                     if (mod.project_type) {
                         selectProjectType(mod.project_type);
+                    } else if (mod.source_path) {
+                        await detectProjectType(mod.source_path);
                     }
                     btn.disabled = !mod.server_path;
                 } else {
@@ -1431,6 +1433,7 @@ networks:
                 password: server.password || '',
                 key_path: server.key_path || '',
                 public_domain: normalizeDomain(document.getElementById('publicDomain').value),
+                project_type: currentProjectType,
                 docker_compose: document.getElementById('dockerCompose').value,
                 dockerfile: document.getElementById('dockerfile').value,
                 env_vars: document.getElementById('envVars').value,

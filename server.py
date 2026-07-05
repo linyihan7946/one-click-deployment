@@ -287,10 +287,13 @@ def default_deploy_templates(project_type, port=None):
         "static": (80, "app-static"),
     }
     default_port, container_name = defaults.get(project_type or "", (3000, "app-web"))
-    try:
-        port = int(port or default_port)
-    except (TypeError, ValueError):
+    if project_type in ("static", "vue", "php"):
         port = default_port
+    else:
+        try:
+            port = int(port or default_port)
+        except (TypeError, ValueError):
+            port = default_port
 
     compose = f"""services:
   app:
@@ -403,6 +406,28 @@ ENTRYPOINT ["dotnet", "YourProject.dll"]
 """,
     }
     return compose, dockerfiles.get(project_type or "", dockerfiles["nodejs"])
+
+
+def infer_dockerfile_project_type(dockerfile_content):
+    """Best-effort detection of the stack implied by Dockerfile text."""
+    lowered = (dockerfile_content or "").lower()
+    if not lowered.strip():
+        return ""
+    if "python:" in lowered or "requirements.txt" in lowered or "gunicorn" in lowered:
+        return "python"
+    if "nginx" in lowered and "/usr/share/nginx/html" in lowered:
+        return "static"
+    if "node:" in lowered or "npm " in lowered or "package*.json" in lowered:
+        return "nodejs"
+    if "golang:" in lowered or "go build" in lowered:
+        return "go"
+    if "maven" in lowered or "gradle" in lowered or "eclipse-temurin" in lowered:
+        return "java"
+    if "php:" in lowered or "apache" in lowered:
+        return "php"
+    if "dotnet" in lowered:
+        return "dotnet"
+    return ""
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -754,7 +779,7 @@ server {{
 }}
 
 location {route_path}/ {{
-    proxy_pass http://{container_name}:{target_port};
+    proxy_pass http://{container_name}:{target_port}/;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -1247,14 +1272,22 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
 
         compose_content = data.get("docker_compose", "")
         dockerfile_content = data.get("dockerfile", "")
-        if not compose_content or not dockerfile_content:
-            default_compose, default_dockerfile = default_deploy_templates(project_type, module_config.get("port"))
-            if not compose_content:
-                compose_content = default_compose
-                log_message("未收到 docker-compose.yml 内容，已使用默认模板", "warn")
-            if not dockerfile_content:
-                dockerfile_content = default_dockerfile
-                log_message("未收到 Dockerfile 内容，已使用默认模板", "warn")
+        default_compose, default_dockerfile = default_deploy_templates(project_type, module_config.get("port"))
+        if not compose_content:
+            compose_content = default_compose
+            log_message("未收到 docker-compose.yml 内容，已使用默认模板", "warn")
+        if not dockerfile_content:
+            dockerfile_content = default_dockerfile
+            log_message("未收到 Dockerfile 内容，已使用默认模板", "warn")
+
+        inferred_dockerfile_type = infer_dockerfile_project_type(dockerfile_content)
+        if project_type and inferred_dockerfile_type and inferred_dockerfile_type != project_type:
+            compose_content = default_compose
+            dockerfile_content = default_dockerfile
+            log_message(
+                f"Dockerfile 看起来是 {inferred_dockerfile_type} 模板，但当前项目识别为 {project_type}，已切换为匹配的默认模板",
+                "warn",
+            )
 
         fallback_container_port = extract_first_container_port(compose_content)
         if compose_content:
