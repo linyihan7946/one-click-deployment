@@ -87,6 +87,7 @@ def normalize_compose_for_path_gateway(compose_content, project_slug=None):
     ports_indent = 0
     changed = False
     env_inserted = "PUBLIC_BASE_PATH" in compose_content
+    container_name_handled = False
 
     for line in lines:
         stripped = line.strip()
@@ -102,8 +103,9 @@ def normalize_compose_for_path_gateway(compose_content, project_slug=None):
             changed = True
             continue
 
-        if project_slug and stripped.startswith("container_name:"):
+        if project_slug and stripped.startswith("container_name:") and not container_name_handled:
             normalized.append(f"{' ' * indent}container_name: {project_slug}-app")
+            container_name_handled = True
             changed = True
             continue
 
@@ -1229,14 +1231,31 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
 
         compose_content = data.get("docker_compose", "")
         dockerfile_content = data.get("dockerfile", "")
+
+        # 优先使用项目自带的 docker-compose.yml / Dockerfile
+        if not compose_content:
+            local_compose = os.path.join(source_path, "docker-compose.yml")
+            if os.path.isfile(local_compose):
+                with open(local_compose, "r", encoding="utf-8") as f:
+                    compose_content = f.read()
+                log_message("使用项目自带的 docker-compose.yml")
+
+        if not dockerfile_content:
+            local_df = os.path.join(source_path, "Dockerfile")
+            if os.path.isfile(local_df):
+                with open(local_df, "r", encoding="utf-8") as f:
+                    dockerfile_content = f.read()
+                log_message("使用项目自带的 Dockerfile")
+
+        # Only use templates if still no content
         if not compose_content or not dockerfile_content:
             default_compose, default_dockerfile = default_deploy_templates(project_type, module_config.get("port"))
             if not compose_content:
                 compose_content = default_compose
-                log_message("未收到 docker-compose.yml 内容，已使用默认模板", "warn")
+                log_message("未提供 docker-compose.yml，已使用默认模板", "warn")
             if not dockerfile_content:
                 dockerfile_content = default_dockerfile
-                log_message("未收到 Dockerfile 内容，已使用默认模板", "warn")
+                log_message("未提供 Dockerfile，已使用默认模板", "warn")
 
         fallback_container_port = extract_first_container_port(compose_content)
         if compose_content:
