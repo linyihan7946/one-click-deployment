@@ -179,16 +179,28 @@ def normalize_dockerfile_for_node_package(dockerfile_content, source_path):
     main_entry = package_data.get("main") if isinstance(package_data, dict) else ""
     main_entry = main_entry if isinstance(main_entry, str) and main_entry.strip() else "server.js"
 
+    # Check if a lock file exists; if not, fall back from npm ci to npm install
+    has_lock_file = any(
+        os.path.isfile(os.path.join(source_path, name))
+        for name in ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+    )
+
     lines = []
     messages = []
     removed_build = False
     rewrote_cmd = False
+    fixed_npm_ci = False
 
     for line in dockerfile_content.splitlines():
         stripped = line.strip()
         if not has_build and re.match(r"^RUN\s+(npm\s+run|yarn|pnpm)\s+build\b", stripped):
             removed_build = True
             continue
+
+        # If no lock file exists, replace npm ci with npm install (npm ci requires lock file)
+        if not has_lock_file and re.match(r"^RUN\s+npm\s+ci\b", stripped):
+            line = line.replace("npm ci", "npm install", 1)
+            fixed_npm_ci = True
 
         if stripped.startswith("CMD "):
             command_looks_like_node_entry = (
@@ -211,12 +223,214 @@ def normalize_dockerfile_for_node_package(dockerfile_content, source_path):
 
     if removed_build:
         messages.append("已根据 package.json 移除缺失的 npm run build 构建步骤")
+    if fixed_npm_ci:
+        messages.append("未找到 lock 文件，已将 npm ci 替换为 npm install")
     if rewrote_cmd and has_start:
         messages.append("已根据 package.json 改用 npm start 启动 Node 服务")
     elif rewrote_cmd:
         messages.append(f"已根据 package.json main 字段改用 node {main_entry} 启动 Node 服务")
 
     return "\n".join(lines) + ("\n" if dockerfile_content.endswith("\n") else ""), messages
+
+
+def detect_monorepo_services(path):
+    """Detect subdirectories with Dockerfile/docker-compose.yml (monorepo pattern).
+
+    Returns a list of dicts describing each service sub-project found.
+    """
+    services = []
+    skip_dirs = {
+        ".", "..", "node_modules", "__pycache__", ".git", ".svn", ".hg",
+        ".vscode", ".idea", "logs", "dist", "build", "target", ".cache",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    }
+    try:
+        entries = sorted(os.listdir(path))
+    except Exception:
+        return services
+
+    for item in entries:
+        sub_path = os.path.join(path, item)
+        if not os.path.isdir(sub_path):
+            continue
+        if item.startswith(".") or item.lower() in skip_dirs:
+            continue
+        try:
+            sub_files = {f.lower() for f in os.listdir(sub_path)}
+        except Exception:
+            continue
+
+        has_dockerfile = "dockerfile" in sub_files
+        has_compose = "docker-compose.yml" in sub_files or "docker-compose.yaml" in sub_files
+        if not has_dockerfile and not has_compose:
+            continue
+
+        services.append({
+            "name": item,
+            "dir": item,
+            "has_dockerfile": has_dockerfile,
+            "has_compose": has_compose,
+        })
+
+    return services
+
+
+def rewrite_compose_for_monorepo(compose_content, subdir):
+    """Rewrite build contexts and relative paths in a sub-compose to be relative to monorepo root."""
+    lines = compose_content.splitlines()
+    result = []
+    in_build_block = False
+    build_indent = 0
+
+    for line in lines:
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+
+        # Track when we enter/leave a build: block
+        if stripped == "build:":
+            in_build_block = True
+            build_indent = indent
+            result.append(line)
+            continue
+
+        if in_build_block:
+            if stripped and indent <= build_indent and not stripped.startswith("#"):
+                in_build_block = False
+            elif stripped.startswith("context:"):
+                old_val = stripped.split(":", 1)[1].strip().strip("'\"")
+                if old_val == ".":
+                    new_val = f"./{subdir}"
+                elif old_val.startswith("./"):
+                    new_val = f"./{subdir}/{old_val[2:]}"
+                elif old_val.startswith("../"):
+                    new_val = old_val  # leave parent refs alone
+                else:
+                    new_val = f"./{subdir}/{old_val}"
+                result.append(f"{' ' * indent}context: {new_val}")
+                continue
+            elif stripped.startswith("dockerfile:"):
+                # dockerfile is relative to context — leave it unchanged
+                result.append(line)
+                continue
+
+        # Rewrite env_file: relative paths
+        if stripped.startswith("env_file:"):
+            val = stripped.split(":", 1)[1].strip().strip("'\"")
+            if val.startswith("./") or (val and not val.startswith("/") and not val.startswith("$")):
+                # inline form — rewrite
+                prefix = line[: len(line) - len(line.lstrip(" "))]
+                new_path = f"./{subdir}/{val.lstrip('./')}" if not val.startswith("./") else f"./{subdir}/{val[2:]}"
+                result.append(f"{prefix}env_file: {new_path}")
+                continue
+
+        # Rewrite env_file list items  - ./.env  or  - .env
+        if stripped.startswith("- .") and ("env" in stripped.lower()):
+            prefix = line[: len(line) - len(line.lstrip(" "))]
+            val = stripped[1:].strip().strip("'\"")
+            new_path = f"./{subdir}/{val.lstrip('./')}" if val.startswith("./") else f"./{subdir}/{val}"
+            result.append(f'{prefix}- "{new_path}"')
+            continue
+
+        result.append(line)
+
+    return "\n".join(result) + ("\n" if compose_content.endswith("\n") else "")
+
+
+def merge_monorepo_compose(sub_services, source_path):
+    """Merge sub-project docker-compose files into one root-level compose.
+
+    For sub-projects with a docker-compose.yml, read and rewrite it.
+    For sub-projects with only a Dockerfile, generate a minimal service entry.
+    Returns (merged_compose_string, list_of_messages).
+    """
+    all_services_lines = []
+    all_volumes_lines = []
+    all_networks_lines = []
+    messages = []
+    seen_volumes = set()
+    seen_networks = set()
+
+    for svc in sub_services:
+        subdir = svc["dir"]
+        compose_path = None
+        for name in ("docker-compose.yml", "docker-compose.yaml"):
+            candidate = os.path.join(source_path, subdir, name)
+            if os.path.isfile(candidate):
+                compose_path = candidate
+                break
+
+        if compose_path:
+            try:
+                with open(compose_path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            except Exception as exc:
+                messages.append(f"读取 {subdir}/{name} 失败: {exc}")
+                continue
+
+            rewritten = rewrite_compose_for_monorepo(raw, subdir)
+            # Parse sections from the rewritten compose
+            current_section = None
+            for line in rewritten.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                indent = len(line) - len(line.lstrip(" "))
+                # Top-level keys (indent == 0)
+                if indent == 0:
+                    if stripped.startswith("services"):
+                        current_section = "services"
+                        continue
+                    elif stripped.startswith("volumes"):
+                        current_section = "volumes"
+                        continue
+                    elif stripped.startswith("networks"):
+                        current_section = "networks"
+                        continue
+                    else:
+                        current_section = "other"
+                        continue
+
+                if current_section == "services":
+                    all_services_lines.append(line)
+                elif current_section == "volumes":
+                    vol_name = stripped.split(":")[0].strip()
+                    if vol_name and vol_name not in seen_volumes:
+                        seen_volumes.add(vol_name)
+                        all_volumes_lines.append(line)
+                elif current_section == "networks":
+                    net_name = stripped.split(":")[0].strip()
+                    if net_name and net_name not in seen_networks:
+                        seen_networks.add(net_name)
+                        all_networks_lines.append(line)
+
+            messages.append(f"已合并子项目 {subdir} 的 docker-compose.yml")
+        else:
+            # Only has Dockerfile — generate a minimal service entry
+            svc_name = subdir.replace("_", "-").replace(" ", "-").lower()
+            all_services_lines.append(f"  {svc_name}:")
+            all_services_lines.append(f"    build:")
+            all_services_lines.append(f"      context: ./{subdir}")
+            all_services_lines.append(f"      dockerfile: Dockerfile")
+            all_services_lines.append(f"    restart: unless-stopped")
+            all_services_lines.append("")
+            messages.append(f"已为子项目 {subdir} 生成默认 service 配置")
+
+    # Build merged compose
+    parts = ["services:"]
+    parts.extend(all_services_lines)
+    parts.append("")
+
+    if all_volumes_lines:
+        parts.append("volumes:")
+        parts.extend(all_volumes_lines)
+        parts.append("")
+
+    if all_networks_lines:
+        parts.append("networks:")
+        parts.extend(all_networks_lines)
+        parts.append("")
+
+    return "\n".join(parts), messages
 
 
 def detect_project_type_for_path(path):
@@ -255,6 +469,13 @@ def detect_project_type_for_path(path):
         return "nodejs", "found package.json"
     if "index.html" in files:
         return "static", "found index.html"
+
+    # Check for monorepo: subdirectories with Dockerfile/docker-compose.yml
+    mono_services = detect_monorepo_services(path)
+    if mono_services:
+        names = ", ".join(s["name"] for s in mono_services)
+        return "monorepo", f"found sub-projects: {names}"
+
     return "", "no known project marker"
 
 
@@ -315,7 +536,7 @@ CMD ["gunicorn", "-b", "0.0.0.0:{port}", "app:app"]
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --production=false
+RUN npm install --production=false
 
 COPY . .
 
@@ -574,7 +795,10 @@ class SSHClient:
         sftp = self.client.open_sftp()
 
         try:
-            def _should_exclude(name):
+            # Patterns that should only be excluded at the root level (depth 0)
+            _root_only_excludes = {".env"}
+
+            def _should_exclude(name, depth=0):
                 name_lower = name.lower()
                 for exc in excludes:
                     exc = exc.strip("/").lower()
@@ -583,6 +807,9 @@ class SSHClient:
                             return True
                     else:
                         if exc == name_lower or exc in name_lower:
+                            # Some patterns (like .env) only apply at root level
+                            if exc in _root_only_excludes and depth > 0:
+                                continue
                             return True
                 return False
 
@@ -600,7 +827,7 @@ class SSHClient:
                         except IOError:
                             pass
 
-            def _upload_recursive(local, remote):
+            def _upload_recursive(local, remote, depth=0):
                 self._ensure_remote_dir(sftp, remote)
 
                 try:
@@ -611,7 +838,7 @@ class SSHClient:
                     return
 
                 for item in items:
-                    if _should_exclude(item):
+                    if _should_exclude(item, depth):
                         continue
 
                     local_path = os.path.join(local, item)
@@ -621,7 +848,7 @@ class SSHClient:
                         continue
 
                     if os.path.isdir(local_path):
-                        _upload_recursive(local_path, remote_path)
+                        _upload_recursive(local_path, remote_path, depth + 1)
                     elif os.path.isfile(local_path):
                         try:
                             sftp.put(local_path, remote_path)
@@ -1017,6 +1244,12 @@ def detect_project_type():
     if "index.html" in files:
         return jsonify({"type": "static", "reason": "找到 index.html"})
 
+    # Check for monorepo: subdirectories with Dockerfile/docker-compose.yml
+    mono_services = detect_monorepo_services(path)
+    if mono_services:
+        names = ", ".join(s["name"] for s in mono_services)
+        return jsonify({"type": "monorepo", "reason": f"检测到前后端分离项目: {names}"})
+
     return jsonify({"type": "", "reason": "无法识别项目类型"})
 
 
@@ -1248,6 +1481,19 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
                 log_message("使用项目自带的 Dockerfile")
 
         # Only use templates if still no content
+        if project_type == "monorepo" and not compose_content:
+            # Monorepo: merge sub-project compose files
+            mono_services = detect_monorepo_services(source_path)
+            if mono_services:
+                compose_content, mono_messages = merge_monorepo_compose(mono_services, source_path)
+                for message in mono_messages:
+                    log_message(message)
+                if not compose_content.strip():
+                    compose_content = ""
+                    log_message("monorepo 合并结果为空，将使用默认模板", "warn")
+            else:
+                log_message("未检测到 monorepo 子项目", "warn")
+
         if not compose_content or not dockerfile_content:
             default_compose, default_dockerfile = default_deploy_templates(project_type, module_config.get("port"))
             if not compose_content:
@@ -1268,8 +1514,8 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
                 f.write(compose_content)
             log_message("docker-compose.yml 已写入")
 
-        # 写入 Dockerfile
-        if dockerfile_content:
+        # 写入 Dockerfile（monorepo 不需要根目录 Dockerfile，各子项目有自己的）
+        if dockerfile_content and project_type != "monorepo":
             dockerfile_content, node_messages = normalize_dockerfile_for_node_package(dockerfile_content, source_path)
             for message in node_messages:
                 log_message(message)
@@ -1348,33 +1594,58 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             return
 
         rc, container_id, err = ssh.exec_command(
-            f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml ps -q | head -n 1",
+            f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml ps -q",
             timeout=30,
         )
-        container_id = container_id.strip()
-        if rc != 0 or not container_id:
+        all_container_ids = [cid.strip() for cid in container_id.strip().split("\n") if cid.strip()]
+        if not all_container_ids:
             set_progress(0, "容器信息获取失败")
             log_message(f"容器信息获取失败: {err}", "error")
             return
 
-        inspect_cmd = (
-            "docker inspect --format '{{.Name}} {{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "
-            f"{shlex.quote(container_id)}"
-        )
-        rc, inspect_out, inspect_err = ssh.exec_command(inspect_cmd, timeout=30)
-        if rc != 0:
-            set_progress(0, "容器信息获取失败")
-            log_message(f"容器信息获取失败: {inspect_err}", "error")
-            return
+        # For monorepo: inspect all containers and prefer one exposing port 80 (frontend)
+        # For single-service: just use the first container
+        container_name = ""
+        target_port = ""
 
-        inspect_parts = inspect_out.strip().split()
-        container_name = inspect_parts[0].lstrip("/") if inspect_parts else ""
-        exposed_ports = [part.split("/")[0] for part in inspect_parts[1:] if "/" in part]
-        target_port = exposed_ports[0] if exposed_ports else fallback_container_port
+        for cid in all_container_ids:
+            inspect_cmd = (
+                "docker inspect --format '{{.Name}} {{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "
+                f"{shlex.quote(cid)}"
+            )
+            rc, inspect_out, inspect_err = ssh.exec_command(inspect_cmd, timeout=30)
+            if rc != 0:
+                continue
+
+            parts = inspect_out.strip().split()
+            c_name = parts[0].lstrip("/") if parts else ""
+            c_ports = [part.split("/")[0] for part in parts[1:] if "/" in part]
+
+            if not c_name:
+                continue
+
+            # Prefer container exposing port 80 (typical frontend/nginx)
+            if "80" in c_ports:
+                container_name = c_name
+                target_port = "80"
+                break
+
+            # Fallback: use first container with any exposed port
+            if not container_name and c_ports:
+                container_name = c_name
+                target_port = c_ports[0]
+
+        if not container_name:
+            container_name = all_container_ids[0]
+            target_port = fallback_container_port
+
         if not container_name or not target_port:
             set_progress(0, "路径网关配置失败")
             log_message("路径网关配置失败: 无法识别容器名或内部端口", "error")
             return
+
+        if project_type == "monorepo":
+            log_message(f"网关路由到容器: {container_name}:{target_port}")
 
         ok, gateway_result = ssh.ensure_path_gateway(project_slug, container_name, target_port, public_domain)
         if not ok:
