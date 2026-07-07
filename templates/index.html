@@ -320,6 +320,91 @@
         .empty-state { text-align: center; padding: 32px; color: var(--text-muted); }
         .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
 
+        /* 二维码模态框 */
+        .qrcode-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.2s ease;
+        }
+        .qrcode-overlay.show { display: flex; }
+        .qrcode-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 28px;
+            max-width: 380px;
+            width: 90%;
+            text-align: center;
+            position: relative;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+            animation: zoomIn 0.25s ease;
+        }
+        .qrcode-card h3 {
+            margin-bottom: 8px;
+            font-size: 18px;
+            color: var(--text);
+        }
+        .qrcode-card .qrcode-desc {
+            font-size: 12px;
+            color: var(--text-dim);
+            margin-bottom: 16px;
+        }
+        .qrcode-card .qrcode-url {
+            font-size: 12px;
+            color: var(--primary);
+            background: var(--bg-input);
+            padding: 8px 12px;
+            border-radius: 6px;
+            word-break: break-all;
+            margin-bottom: 16px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            border: 1px solid var(--border);
+        }
+        .qrcode-card #qrcodeContainer {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 20px;
+            padding: 12px;
+            background: white;
+            border-radius: 12px;
+        }
+        .qrcode-card #qrcodeContainer img,
+        .qrcode-card #qrcodeContainer canvas {
+            display: block;
+        }
+        .qrcode-close {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            background: transparent;
+            border: none;
+            color: var(--text-dim);
+            font-size: 20px;
+            cursor: pointer;
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s;
+        }
+        .qrcode-close:hover { background: var(--bg-input); color: var(--text); }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes zoomIn {
+            from { transform: scale(0.9); opacity: 0; }
+            to { transform: scale(1); opacity: 1; }
+        }
+
         /* 项目类型选择器 */
         .project-types {
             display: grid;
@@ -492,6 +577,7 @@
                     <div style="display:flex;gap:8px;align-items:center;">
                         <input type="text" id="modSourcePath" placeholder="选择或输入本地项目路径" style="flex:1;">
                         <button class="btn btn-outline btn-sm" id="openModuleAccessUrlBtn" onclick="openModuleAccessUrl()" style="white-space:nowrap;" disabled> 打开网址</button>
+                        <button class="btn btn-outline btn-sm" id="qrcodeModuleBtn" onclick="showModuleQrcode()" style="white-space:nowrap;" disabled>📱 二维码</button>
                     </div>
                     <div class="btn-group" style="margin-top:8px;">
                         <button class="btn btn-outline btn-sm" onclick="openPathBrowser()">📁 浏览目录</button>
@@ -628,7 +714,7 @@
                 <div style="display:flex;gap:8px;align-items:center;">
                     <input type="text" id="deploySourcePath" placeholder="选择或输入本地项目路径" style="flex:1;">
                     <button class="btn btn-outline btn-sm" id="openAccessUrlBtn" onclick="openAccessUrl()" style="white-space:nowrap;" disabled>🔗 打开网址</button>
-                </div>
+                    <button class="btn btn-outline btn-sm" id="qrcodeAccessBtn" onclick="showAccessQrcode()" style="white-space:nowrap;" disabled>📱 二维码</button>
             </div>
 
             <div class="form-group">
@@ -660,6 +746,7 @@
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script>
         // ========================
         //  Docker 模板库
@@ -1277,6 +1364,8 @@ networks:
             // 更新模块表单的访问地址按钮状态
             const modBtn = document.getElementById('openModuleAccessUrlBtn');
             if (modBtn) modBtn.disabled = !mod.server_path;
+            const modQrBtn = document.getElementById('qrcodeModuleBtn');
+            if (modQrBtn) modQrBtn.disabled = !mod.server_path;
 
             document.querySelector('[data-tab="module-form"]').click();
             showToast(`已选择模块: ${name}`);
@@ -1393,14 +1482,17 @@ networks:
             moduleSelect.onchange = () => {
                 const mod = config.modules.find(m => m.name === moduleSelect.value);
                 const btn = document.getElementById('openAccessUrlBtn');
+                const qrBtn = document.getElementById('qrcodeAccessBtn');
                 if (mod) {
                     document.getElementById('deploySourcePath').value = mod.source_path;
                     if (mod.project_type) {
                         selectProjectType(mod.project_type);
                     }
                     btn.disabled = !mod.server_path;
+                    if (qrBtn) qrBtn.disabled = !mod.server_path;
                 } else {
                     btn.disabled = true;
+                    if (qrBtn) qrBtn.disabled = true;
                 }
             };
         }
@@ -1540,6 +1632,92 @@ networks:
         }
 
         // ========================
+        //  二维码生成
+        // ========================
+        let qrcodeInstance = null;
+
+        function buildAccessUrl(serverPath) {
+            const domain = normalizeDomain(document.getElementById('publicDomain').value);
+            return `${getAccessScheme(domain)}://${domain}/${serverPath}/`;
+        }
+
+        function showQrcodeModal(url) {
+            const overlay = document.getElementById('qrcodeOverlay');
+            const container = document.getElementById('qrcodeContainer');
+            const urlText = document.getElementById('qrcodeUrl');
+
+            // 清空之前的二维码
+            container.innerHTML = '';
+            urlText.textContent = url;
+
+            // 生成新二维码（使用 canvas 方式避免跨域图片问题）
+            qrcodeInstance = new QRCode(container, {
+                text: url,
+                width: 220,
+                height: 220,
+                colorDark: '#0f172a',
+                colorLight: '#ffffff',
+                correctLevel: QRCode.CorrectLevel.H
+            });
+
+            overlay.classList.add('show');
+        }
+
+        function closeQrcodeModal() {
+            document.getElementById('qrcodeOverlay').classList.remove('show');
+        }
+
+        function copyQrcodeUrl() {
+            const url = document.getElementById('qrcodeUrl').textContent;
+            if (!url) return;
+
+            const copyToClipboard = (text) => {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    return navigator.clipboard.writeText(text);
+                }
+                // 兼容旧浏览器
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.style.position = 'fixed';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                try { document.execCommand('copy'); } catch (e) {}
+                document.body.removeChild(textarea);
+                return Promise.resolve();
+            };
+
+            copyToClipboard(url).then(() => {
+                showToast('链接已复制到剪贴板');
+            }).catch(() => {
+                showToast('复制失败，请手动复制', 'error');
+            });
+        }
+
+        function showAccessQrcode() {
+            const moduleSelect = document.getElementById('deployModule');
+            if (!moduleSelect.value) {
+                showToast('请先选择一个模块', 'error');
+                return;
+            }
+            const mod = config.modules.find(m => m.name === moduleSelect.value);
+            if (!mod || !mod.server_path) {
+                showToast('模块未配置远程路径', 'error');
+                return;
+            }
+            showQrcodeModal(buildAccessUrl(mod.server_path));
+        }
+
+        function showModuleQrcode() {
+            const serverPath = document.getElementById('modServerPath').value.trim();
+            if (!serverPath) {
+                showToast('请先填写远程子路径', 'error');
+                return;
+            }
+            showQrcodeModal(buildAccessUrl(serverPath));
+        }
+
+        // ========================
         //  初始化
         // ========================
         document.getElementById('publicDomain').addEventListener('input', updateUrlPreview);
@@ -1547,13 +1725,28 @@ networks:
         // 模块表单：远程子路径变化时更新访问地址按钮状态
         document.getElementById('modServerPath').addEventListener('input', function () {
             const btn = document.getElementById('openModuleAccessUrlBtn');
+            const qrBtn = document.getElementById('qrcodeModuleBtn');
             if (btn) btn.disabled = !this.value.trim();
+            if (qrBtn) qrBtn.disabled = !this.value.trim();
         });
         // 初始状态：modServerPath 默认值为 "web"
         const initModBtn = document.getElementById('openModuleAccessUrlBtn');
+        const initModQrBtn = document.getElementById('qrcodeModuleBtn');
         if (initModBtn) initModBtn.disabled = !document.getElementById('modServerPath').value.trim();
+        if (initModQrBtn) initModQrBtn.disabled = !document.getElementById('modServerPath').value.trim();
 
         loadConfig();
     </script>
+    <!-- 二维码模态框 -->
+    <div class="qrcode-overlay" id="qrcodeOverlay" onclick="if(event.target===this) closeQrcodeModal()">
+        <div class="qrcode-card">
+            <button class="qrcode-close" onclick="closeQrcodeModal()" title="关闭">✕</button>
+            <h3>📱 手机扫码访问</h3>
+            <p class="qrcode-desc">使用微信 / 任意浏览器扫描下方二维码即可打开</p>
+            <div id="qrcodeContainer"></div>
+            <div class="qrcode-url" id="qrcodeUrl"></div>
+            <button class="btn btn-primary" onclick="copyQrcodeUrl()" style="width:100%;">📋 复制链接</button>
+        </div>
+    </div>
 </body>
 </html>
