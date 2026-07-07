@@ -79,6 +79,29 @@ def extract_first_container_port(compose_content):
     return ""
 
 
+def count_compose_services(compose_content):
+    """Best-effort count of services in a docker-compose YAML string."""
+    in_services = False
+    services_indent = 0
+    count = 0
+
+    for line in compose_content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+
+        if indent == 0:
+            in_services = stripped == "services:"
+            services_indent = indent
+            continue
+
+        if in_services and indent == services_indent + 2 and stripped.endswith(":"):
+            count += 1
+
+    return count
+
+
 def normalize_compose_for_path_gateway(compose_content, project_slug=None):
     """Convert host port mappings to internal expose entries for path-based gateway routing."""
     lines = compose_content.splitlines()
@@ -88,10 +111,23 @@ def normalize_compose_for_path_gateway(compose_content, project_slug=None):
     changed = False
     env_inserted = "PUBLIC_BASE_PATH" in compose_content
     container_name_handled = False
+    service_count = count_compose_services(compose_content)
+    is_multi_service = service_count > 1
+    in_services = False
+    services_indent = 0
+    current_service = ""
+    app_like_services = {"app", "web", "frontend", "backend", "api", "server"}
 
-    for line in lines:
+    for idx, line in enumerate(lines):
         stripped = line.strip()
         indent = len(line) - len(line.lstrip(" "))
+
+        if indent == 0 and stripped:
+            in_services = stripped == "services:"
+            services_indent = indent
+            current_service = ""
+        elif in_services and indent == services_indent + 2 and stripped.endswith(":"):
+            current_service = stripped[:-1].strip().strip("'\"")
 
         if in_ports and stripped and indent <= ports_indent and not stripped.startswith("-"):
             in_ports = False
@@ -103,15 +139,29 @@ def normalize_compose_for_path_gateway(compose_content, project_slug=None):
             changed = True
             continue
 
-        if project_slug and stripped.startswith("container_name:") and not container_name_handled:
+        if project_slug and not is_multi_service and stripped.startswith("container_name:") and not container_name_handled:
             normalized.append(f"{' ' * indent}container_name: {project_slug}-app")
             container_name_handled = True
             changed = True
             continue
 
-        if project_slug and stripped == "environment:" and not env_inserted:
+        should_inject_env = not is_multi_service or current_service in app_like_services
+        if project_slug and stripped == "environment:" and not env_inserted and should_inject_env:
             normalized.append(line)
-            normalized.append(f"{' ' * (indent + 2)}- PUBLIC_BASE_PATH=/{project_slug}")
+            env_is_list = True
+            for next_line in lines[idx + 1:]:
+                next_stripped = next_line.strip()
+                if not next_stripped or next_stripped.startswith("#"):
+                    continue
+                next_indent = len(next_line) - len(next_line.lstrip(" "))
+                if next_indent <= indent:
+                    break
+                env_is_list = next_stripped.startswith("-")
+                break
+            if env_is_list:
+                normalized.append(f"{' ' * (indent + 2)}- PUBLIC_BASE_PATH=/{project_slug}")
+            else:
+                normalized.append(f"{' ' * (indent + 2)}PUBLIC_BASE_PATH: /{project_slug}")
             env_inserted = True
             changed = True
             continue
@@ -1466,12 +1516,17 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         dockerfile_content = data.get("dockerfile", "")
 
         # 优先使用项目自带的 docker-compose.yml / Dockerfile
-        if not compose_content:
-            local_compose = os.path.join(source_path, "docker-compose.yml")
+        local_compose = os.path.join(source_path, "docker-compose.yml")
+        if os.path.isfile(local_compose) and (not compose_content or project_type == "monorepo"):
             if os.path.isfile(local_compose):
                 with open(local_compose, "r", encoding="utf-8") as f:
                     compose_content = f.read()
                 log_message("使用项目自带的 docker-compose.yml")
+
+        if project_type == "monorepo" and os.path.isfile(local_compose):
+            with open(local_compose, "r", encoding="utf-8") as f:
+                compose_content = f.read()
+            log_message("monorepo 项目优先使用项目自带的 docker-compose.yml")
 
         if not dockerfile_content:
             local_df = os.path.join(source_path, "Dockerfile")
@@ -1494,12 +1549,13 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             else:
                 log_message("未检测到 monorepo 子项目", "warn")
 
-        if not compose_content or not dockerfile_content:
+        needs_root_dockerfile = project_type != "monorepo"
+        if not compose_content or (needs_root_dockerfile and not dockerfile_content):
             default_compose, default_dockerfile = default_deploy_templates(project_type, module_config.get("port"))
             if not compose_content:
                 compose_content = default_compose
                 log_message("未提供 docker-compose.yml，已使用默认模板", "warn")
-            if not dockerfile_content:
+            if needs_root_dockerfile and not dockerfile_content:
                 dockerfile_content = default_dockerfile
                 log_message("未提供 Dockerfile，已使用默认模板", "warn")
 
@@ -1607,10 +1663,14 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # For single-service: just use the first container
         container_name = ""
         target_port = ""
+        fallback_container_name = ""
+        fallback_target_port = ""
+        preferred_services = {"frontend", "web", "app", "backend", "api", "server"}
+        infrastructure_services = {"db", "database", "postgres", "postgresql", "mysql", "redis", "mongo", "mongodb"}
 
         for cid in all_container_ids:
             inspect_cmd = (
-                "docker inspect --format '{{.Name}} {{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "
+                "docker inspect --format '{{.Name}} {{index .Config.Labels \"com.docker.compose.service\"}} {{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "
                 f"{shlex.quote(cid)}"
             )
             rc, inspect_out, inspect_err = ssh.exec_command(inspect_cmd, timeout=30)
@@ -1619,21 +1679,38 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
 
             parts = inspect_out.strip().split()
             c_name = parts[0].lstrip("/") if parts else ""
-            c_ports = [part.split("/")[0] for part in parts[1:] if "/" in part]
+            c_service = parts[1] if len(parts) > 1 and "/" not in parts[1] else ""
+            port_parts = parts[2:] if c_service else parts[1:]
+            c_ports = [part.split("/")[0] for part in port_parts if "/" in part]
 
             if not c_name:
                 continue
 
-            # Prefer container exposing port 80 (typical frontend/nginx)
-            if "80" in c_ports:
+            if c_service in infrastructure_services:
+                if not fallback_container_name and c_ports:
+                    fallback_container_name = c_name
+                    fallback_target_port = c_ports[0]
+                continue
+
+            # Prefer app-like containers exposing port 80 (typical frontend/nginx)
+            if "80" in c_ports and (not c_service or c_service in preferred_services):
                 container_name = c_name
                 target_port = "80"
                 break
 
-            # Fallback: use first container with any exposed port
+            if c_service in preferred_services and c_ports:
+                container_name = c_name
+                target_port = c_ports[0]
+                continue
+
+            # Fallback: use first non-infrastructure container with any exposed port
             if not container_name and c_ports:
                 container_name = c_name
                 target_port = c_ports[0]
+
+        if not container_name and fallback_container_name:
+            container_name = fallback_container_name
+            target_port = fallback_target_port
 
         if not container_name:
             container_name = all_container_ids[0]
