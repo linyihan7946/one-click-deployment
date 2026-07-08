@@ -17,7 +17,7 @@ import io
 import fnmatch
 import ipaddress
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, Response, render_template, request, jsonify
 
 import paramiko
 
@@ -1189,6 +1189,37 @@ def update_settings():
     config["settings"] = data
     save_config(config)
     return jsonify({"success": True})
+
+
+@app.route("/api/qrcode", methods=["GET"])
+def generate_qrcode():
+    """生成访问地址二维码 SVG。"""
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "缺少 url 参数"}), 400
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        return jsonify({"error": "仅支持 http/https 网址"}), 400
+
+    try:
+        import qrcode
+        import qrcode.image.svg
+    except ImportError:
+        return jsonify({"error": "缺少 qrcode 依赖，请先执行 pip install -r requirements.txt"}), 500
+
+    image = qrcode.make(
+        url,
+        image_factory=qrcode.image.svg.SvgPathImage,
+        box_size=10,
+        border=4,
+    )
+    output = io.BytesIO()
+    image.save(output)
+
+    response = Response(output.getvalue(), mimetype="image/svg+xml")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.route("/api/browse", methods=["POST"])

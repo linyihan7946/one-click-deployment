@@ -129,6 +129,16 @@
         .btn-outline:hover { border-color: var(--primary); color: var(--primary); }
 
         .btn-group { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+        .action-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .action-row input {
+            flex: 1;
+            min-width: 0;
+        }
+        .action-row .btn { white-space: nowrap; }
 
         .server-list, .module-list {
             max-height: 200px;
@@ -456,6 +466,8 @@
             .container { grid-template-columns: 1fr; padding: 16px; }
             .form-row, .form-row-3 { grid-template-columns: 1fr; }
             .project-types { grid-template-columns: repeat(3, 1fr); }
+            .action-row { flex-wrap: wrap; }
+            .action-row input { flex-basis: 100%; }
         }
     </style>
 </head>
@@ -574,14 +586,20 @@
                 </div>
                 <div class="form-group">
                     <label>本地项目目录</label>
-                    <div style="display:flex;gap:8px;align-items:center;">
-                        <input type="text" id="modSourcePath" placeholder="选择或输入本地项目路径" style="flex:1;">
-                        <button class="btn btn-outline btn-sm" id="openModuleAccessUrlBtn" onclick="openModuleAccessUrl()" style="white-space:nowrap;" disabled> 打开网址</button>
-                        <button class="btn btn-outline btn-sm" id="qrcodeModuleBtn" onclick="showModuleQrcode()" style="white-space:nowrap;" disabled>📱 二维码</button>
+                    <div class="action-row">
+                        <input type="text" id="modSourcePath" placeholder="选择或输入本地项目路径">
+                        <button class="btn btn-outline btn-sm" id="openModuleAccessUrlBtn" onclick="openModuleAccessUrl()" disabled>🔗 打开网址</button>
+                        <button class="btn btn-primary btn-sm" id="qrcodeModuleBtn" onclick="showModuleQrcode()" disabled>📱 生成二维码</button>
                     </div>
                     <div class="btn-group" style="margin-top:8px;">
                         <button class="btn btn-outline btn-sm" onclick="openPathBrowser()">📁 浏览目录</button>
                         <button class="btn btn-outline btn-sm" onclick="detectProjectType()">🔍 自动检测项目类型</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>访问地址</label>
+                    <div class="action-row">
+                        <input type="text" id="moduleAccessUrl" placeholder="填写远程子路径后生成访问地址" readonly>
                     </div>
                 </div>
 
@@ -711,10 +729,18 @@
             </div>
             <div class="form-group">
                 <label>本地项目目录</label>
-                <div style="display:flex;gap:8px;align-items:center;">
-                    <input type="text" id="deploySourcePath" placeholder="选择或输入本地项目路径" style="flex:1;">
-                    <button class="btn btn-outline btn-sm" id="openAccessUrlBtn" onclick="openAccessUrl()" style="white-space:nowrap;" disabled>🔗 打开网址</button>
-                    <button class="btn btn-outline btn-sm" id="qrcodeAccessBtn" onclick="showAccessQrcode()" style="white-space:nowrap;" disabled>📱 二维码</button>
+                <div class="action-row">
+                    <input type="text" id="deploySourcePath" placeholder="选择或输入本地项目路径">
+                    <button class="btn btn-outline btn-sm" id="openAccessUrlBtn" onclick="openAccessUrl()" disabled>🔗 打开网址</button>
+                    <button class="btn btn-primary btn-sm" id="qrcodeAccessBtn" onclick="showAccessQrcode()" disabled>📱 生成二维码</button>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>访问地址</label>
+                <div class="action-row">
+                    <input type="text" id="deployAccessUrl" placeholder="选择模块后生成访问地址" readonly>
+                </div>
             </div>
 
             <div class="form-group">
@@ -746,7 +772,6 @@
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <script>
         // ========================
         //  Docker 模板库
@@ -1142,6 +1167,10 @@ networks:
             return /^(\d{1,3}\.){3}\d{1,3}$/.test(domain) ? 'http' : 'https';
         }
 
+        function normalizeServerPath(value) {
+            return (value || '').trim().replace(/^\/+|\/+$/g, '');
+        }
+
         function renderSettings() {
             const settings = config.settings || {};
             const domain = normalizeDomain(settings.public_domain || settings.domain || 'www.aigenimage.cn');
@@ -1153,6 +1182,37 @@ networks:
         function updateUrlPreview() {
             const domain = normalizeDomain(document.getElementById('publicDomain').value);
             document.getElementById('urlPreview').value = `${getAccessScheme(domain)}://${domain}/项目名/`;
+            updateAccessUrlPreviews();
+        }
+
+        function setAccessControls(inputId, openBtnId, qrBtnId, serverPath) {
+            const cleanPath = normalizeServerPath(serverPath);
+            const input = document.getElementById(inputId);
+            const openBtn = document.getElementById(openBtnId);
+            const qrBtn = document.getElementById(qrBtnId);
+            if (input) input.value = cleanPath ? buildAccessUrl(cleanPath) : '';
+            if (openBtn) openBtn.disabled = !cleanPath;
+            if (qrBtn) qrBtn.disabled = !cleanPath;
+        }
+
+        function updateModuleAccessControls() {
+            setAccessControls(
+                'moduleAccessUrl',
+                'openModuleAccessUrlBtn',
+                'qrcodeModuleBtn',
+                document.getElementById('modServerPath').value
+            );
+        }
+
+        function updateDeployAccessControls() {
+            const moduleSelect = document.getElementById('deployModule');
+            const mod = config.modules.find(m => m.name === moduleSelect.value);
+            setAccessControls('deployAccessUrl', 'openAccessUrlBtn', 'qrcodeAccessBtn', mod ? mod.server_path : '');
+        }
+
+        function updateAccessUrlPreviews() {
+            updateModuleAccessControls();
+            updateDeployAccessControls();
         }
 
         async function saveSettings() {
@@ -1361,11 +1421,7 @@ networks:
                 selectProjectType(mod.project_type);
             }
 
-            // 更新模块表单的访问地址按钮状态
-            const modBtn = document.getElementById('openModuleAccessUrlBtn');
-            if (modBtn) modBtn.disabled = !mod.server_path;
-            const modQrBtn = document.getElementById('qrcodeModuleBtn');
-            if (modQrBtn) modQrBtn.disabled = !mod.server_path;
+            updateModuleAccessControls();
 
             document.querySelector('[data-tab="module-form"]').click();
             showToast(`已选择模块: ${name}`);
@@ -1481,20 +1537,17 @@ networks:
 
             moduleSelect.onchange = () => {
                 const mod = config.modules.find(m => m.name === moduleSelect.value);
-                const btn = document.getElementById('openAccessUrlBtn');
-                const qrBtn = document.getElementById('qrcodeAccessBtn');
                 if (mod) {
                     document.getElementById('deploySourcePath').value = mod.source_path;
                     if (mod.project_type) {
                         selectProjectType(mod.project_type);
                     }
-                    btn.disabled = !mod.server_path;
-                    if (qrBtn) qrBtn.disabled = !mod.server_path;
                 } else {
-                    btn.disabled = true;
-                    if (qrBtn) qrBtn.disabled = true;
+                    document.getElementById('deploySourcePath').value = '';
                 }
+                updateDeployAccessControls();
             };
+            updateDeployAccessControls();
         }
 
         // ========================
@@ -1615,7 +1668,7 @@ networks:
                 showToast('模块未配置远程路径', 'error');
                 return;
             }
-            window.open(`${getAccessScheme(domain)}://${domain}/${mod.server_path}/`, '_blank');
+            window.open(buildAccessUrl(mod.server_path), '_blank');
         }
 
         // ========================
@@ -1628,17 +1681,16 @@ networks:
                 showToast('请先填写远程子路径', 'error');
                 return;
             }
-            window.open(`${getAccessScheme(domain)}://${domain}/${serverPath}/`, '_blank');
+            window.open(buildAccessUrl(serverPath), '_blank');
         }
 
         // ========================
         //  二维码生成
         // ========================
-        let qrcodeInstance = null;
-
         function buildAccessUrl(serverPath) {
             const domain = normalizeDomain(document.getElementById('publicDomain').value);
-            return `${getAccessScheme(domain)}://${domain}/${serverPath}/`;
+            const cleanPath = normalizeServerPath(serverPath);
+            return `${getAccessScheme(domain)}://${domain}/${cleanPath}/`;
         }
 
         function showQrcodeModal(url) {
@@ -1650,15 +1702,15 @@ networks:
             container.innerHTML = '';
             urlText.textContent = url;
 
-            // 生成新二维码（使用 canvas 方式避免跨域图片问题）
-            qrcodeInstance = new QRCode(container, {
-                text: url,
-                width: 220,
-                height: 220,
-                colorDark: '#0f172a',
-                colorLight: '#ffffff',
-                correctLevel: QRCode.CorrectLevel.H
-            });
+            const image = document.createElement('img');
+            image.src = `/api/qrcode?url=${encodeURIComponent(url)}`;
+            image.alt = '访问地址二维码';
+            image.width = 220;
+            image.height = 220;
+            image.onerror = () => {
+                container.innerHTML = '<div style="color:#ef4444;font-size:13px;padding:24px;">二维码生成失败，请确认已安装 qrcode 依赖。</div>';
+            };
+            container.appendChild(image);
 
             overlay.classList.add('show');
         }
@@ -1724,16 +1776,10 @@ networks:
 
         // 模块表单：远程子路径变化时更新访问地址按钮状态
         document.getElementById('modServerPath').addEventListener('input', function () {
-            const btn = document.getElementById('openModuleAccessUrlBtn');
-            const qrBtn = document.getElementById('qrcodeModuleBtn');
-            if (btn) btn.disabled = !this.value.trim();
-            if (qrBtn) qrBtn.disabled = !this.value.trim();
+            updateModuleAccessControls();
         });
         // 初始状态：modServerPath 默认值为 "web"
-        const initModBtn = document.getElementById('openModuleAccessUrlBtn');
-        const initModQrBtn = document.getElementById('qrcodeModuleBtn');
-        if (initModBtn) initModBtn.disabled = !document.getElementById('modServerPath').value.trim();
-        if (initModQrBtn) initModQrBtn.disabled = !document.getElementById('modServerPath').value.trim();
+        updateModuleAccessControls();
 
         loadConfig();
     </script>

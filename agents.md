@@ -172,6 +172,7 @@ Web 前端内置 8 种项目类型的 Docker 模板：
 - API 请求统一使用 `fetch` + `application/json`
 - 所有路径拼接使用 `os.path.join`（Python）或模板字符串（JS）
 - 部署状态通过全局 `deploy_status` 字典 + `threading.Lock` 实现线程安全
+- 修改 Web 页面、后端接口或依赖后，如果本地 `http://localhost:5000` 已有旧服务在运行，必须先关闭旧的 Flask 进程，再用当前工作区代码重启服务，避免浏览器仍看到旧页面或旧接口。
 
 ## 快速启动
 
