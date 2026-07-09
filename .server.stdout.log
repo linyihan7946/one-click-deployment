@@ -7,7 +7,7 @@
  |_____/ \____/|_|  \_\  |_|  |______\_____|
 
   一键部署 - Web 可视化部署工具
-  http://localhost:5000
+  http://localhost:5001
 
  * Serving Flask app 'server'
  * Debug mode: off

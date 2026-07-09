@@ -762,6 +762,86 @@ class SSHClient:
         except Exception as e:
             return -1, "", str(e)
 
+    def exec_command_stream(self, cmd, timeout=1200, idle_timeout=300, on_stdout=None, on_stderr=None, get_pty=False):
+        """执行远程命令并实时回调输出，避免长时间构建看起来卡死。"""
+        if not self.client:
+            return -1, "", "SSH 未连接"
+
+        def emit_complete_lines(buffer, callback):
+            lines = buffer.splitlines(keepends=True)
+            if lines and not lines[-1].endswith(("\n", "\r")):
+                pending = lines.pop()
+            else:
+                pending = ""
+            for line in lines:
+                text = line.strip()
+                if text and callback:
+                    callback(text)
+            return pending
+
+        out_chunks = []
+        err_chunks = []
+        out_buffer = ""
+        err_buffer = ""
+        started_at = time.time()
+        last_activity = started_at
+
+        try:
+            stdin, stdout, stderr = self.client.exec_command(cmd, timeout=timeout, get_pty=get_pty)
+            stdin.close()
+            channel = stdout.channel
+
+            while True:
+                has_activity = False
+
+                while channel.recv_ready():
+                    data = channel.recv(4096).decode("utf-8", errors="replace")
+                    out_chunks.append(data)
+                    out_buffer += data
+                    out_buffer = emit_complete_lines(out_buffer, on_stdout)
+                    has_activity = True
+
+                while channel.recv_stderr_ready():
+                    data = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                    err_chunks.append(data)
+                    err_buffer += data
+                    err_buffer = emit_complete_lines(err_buffer, on_stderr)
+                    has_activity = True
+
+                if has_activity:
+                    last_activity = time.time()
+
+                if channel.exit_status_ready():
+                    while channel.recv_ready():
+                        data = channel.recv(4096).decode("utf-8", errors="replace")
+                        out_chunks.append(data)
+                        out_buffer += data
+                    while channel.recv_stderr_ready():
+                        data = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                        err_chunks.append(data)
+                        err_buffer += data
+                    break
+
+                now = time.time()
+                if timeout and now - started_at > timeout:
+                    channel.close()
+                    return -1, "".join(out_chunks), "".join(err_chunks), f"命令执行超时（超过 {timeout} 秒）"
+                if idle_timeout and now - last_activity > idle_timeout:
+                    channel.close()
+                    return -1, "".join(out_chunks), "".join(err_chunks), f"命令长时间无输出（超过 {idle_timeout} 秒）"
+
+                time.sleep(0.2)
+
+            if out_buffer.strip() and on_stdout:
+                on_stdout(out_buffer.strip())
+            if err_buffer.strip() and on_stderr:
+                on_stderr(err_buffer.strip())
+
+            exit_code = channel.recv_exit_status()
+            return exit_code, "".join(out_chunks), "".join(err_chunks), ""
+        except Exception as e:
+            return -1, "".join(out_chunks), "".join(err_chunks), str(e)
+
     def prepare_remote_dir(self, remote_dir):
         """Create a writable remote deploy directory for the current SSH user."""
         remote_dir_q = shlex.quote(remote_dir)
@@ -1439,6 +1519,16 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             deploy_status["progress"] = pct
             deploy_status["message"] = msg
 
+    def get_positive_int(value, default):
+        try:
+            number = int(value)
+            return number if number > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    build_timeout = get_positive_int(settings.get("build_timeout_seconds"), 1800)
+    build_idle_timeout = get_positive_int(settings.get("build_idle_timeout_seconds"), 300)
+
     try:
         # Step 0: 验证本地源路径
         source_path = os.path.abspath(source_path)
@@ -1658,21 +1748,38 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         # Step 7: 远程 Docker 部署 (90%)
         set_progress(90, "远程构建和部署...")
         compose_project_flag = f"-p {shlex.quote(project_slug)}"
-        log_message("执行 docker compose pull...")
-        ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml pull", timeout=120)
 
-        log_message("执行 docker compose build...")
-        rc, out, err = ssh.exec_command(f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml build", timeout=600)
-        if out:
-            for line in out.strip().split("\n"):
-                if line.strip():
-                    log_message(line.strip())
-        if err:
-            for line in err.strip().split("\n"):
-                if line.strip():
-                    log_message(line.strip(), "warn")
+        def run_streamed_step(title, command, timeout, idle_timeout=None):
+            log_message(title)
+            rc, out, err, stream_error = ssh.exec_command_stream(
+                command,
+                timeout=timeout,
+                idle_timeout=idle_timeout,
+                on_stdout=lambda line: log_message(line),
+                on_stderr=lambda line: log_message(line),
+            )
+            if stream_error:
+                log_message(stream_error, "error")
+            return rc, out, err
+
+        pull_cmd = f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml pull"
+        rc, out, err = run_streamed_step("执行 docker compose pull...", pull_cmd, timeout=300, idle_timeout=180)
+        if rc != 0:
+            log_message("docker compose pull 未完成，将继续尝试本地构建", "warn")
+
+        build_progress_arg = " --progress=plain" if compose_prefix == "docker compose" else ""
+        build_cmd = f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml build{build_progress_arg}"
+        rc, out, err = run_streamed_step(
+            f"执行 docker compose build...（最长等待 {build_timeout} 秒，{build_idle_timeout} 秒无输出则中止）",
+            build_cmd,
+            timeout=build_timeout,
+            idle_timeout=build_idle_timeout,
+        )
         if rc != 0:
             set_progress(0, "Docker 构建失败")
+            detail = (err or out).strip()
+            if detail:
+                log_message(detail[-1000:], "error")
             log_message("Docker 构建失败，已停止部署", "error")
             return
 
@@ -1695,16 +1802,28 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         if rc != 0 and cleanup_err.strip():
             log_message(f"历史同名容器检查失败，将继续尝试启动: {cleanup_err.strip()}", "warn")
 
-        rc, out, err = ssh.exec_command(
-            f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml up -d --remove-orphans", timeout=120
+        up_cmd = f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml up -d --remove-orphans"
+        rc, out, err, stream_error = ssh.exec_command_stream(
+            up_cmd,
+            timeout=300,
+            idle_timeout=180,
+            on_stdout=lambda line: log_message(line),
+            on_stderr=lambda line: log_message(line),
         )
+        if stream_error:
+            log_message(stream_error, "error")
         if rc != 0 and "is already in use" in (err or out):
             log_message(f"检测到同名容器冲突，正在移除 {expected_container_name} 后重试...", "warn")
             ssh.exec_command(f"docker rm -f {expected_container_q}", timeout=60)
-            rc, out, err = ssh.exec_command(
-                f"cd -- {remote_dir_q} && {compose_prefix} {compose_project_flag} -f docker-compose.yml up -d --remove-orphans",
+            rc, out, err, stream_error = ssh.exec_command_stream(
+                up_cmd,
                 timeout=120,
+                idle_timeout=90,
+                on_stdout=lambda line: log_message(line),
+                on_stderr=lambda line: log_message(line),
             )
+            if stream_error:
+                log_message(stream_error, "error")
         if rc == 0:
             log_message("容器启动成功！")
         else:
