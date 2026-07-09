@@ -139,7 +139,8 @@ Web 前端内置 8 种项目类型的 Docker 模板：
 
 1. **首选 rsync**: 增量传输，支持 exclude 规则
 2. **回退 scp + tar**: 先本地压缩 → scp 上传 → 远程解压
-3. **排除规则**: `.git`, `node_modules`, `.env`, `*.log`, `.claude`, `.vscode`, `__pycache__`, `.deploy-logs`, `.deploy-ssh`
+3. **排除规则**: `.git`, `node_modules`, `.env`, `*.log`, `.claude`, `.vscode`, `__pycache__`, `.deploy-logs`, `.deploy-ssh`，以及 SQLite 运行时文件 `data.db`, `*.sqlite`, `*.sqlite3`, `*.db-shm`, `*.db-wal`
+4. **项目自带部署文件优先**: 如果源项目根目录存在 `docker-compose.yml` 或 `Dockerfile`，部署时优先使用项目自带文件，确保 volume/env_file 等生产配置不会被默认模板覆盖
 
 ## 项目类型检测规则
 
@@ -173,6 +174,9 @@ Web 前端内置 8 种项目类型的 Docker 模板：
 - 所有路径拼接使用 `os.path.join`（Python）或模板字符串（JS）
 - 部署状态通过全局 `deploy_status` 字典 + `threading.Lock` 实现线程安全
 - 修改 Web 页面、后端接口或依赖后，如果本地 `http://localhost:5000` 已有旧服务在运行，必须先关闭旧的 Flask 进程，再用当前工作区代码重启服务，避免浏览器仍看到旧页面或旧接口。
+- 默认文件同步会排除 SQLite 数据库运行时文件，避免部署时把本地测试数据库覆盖到线上；需要持久化数据的业务项目应使用 Docker volume/bind mount。
+- 项目根目录存在 `docker-compose.yml` / `Dockerfile` 时会优先使用这些文件；如需改生产部署方式，应修改业务项目内的部署文件。
+- 部署前会在远程 `data/data.db` 不存在时尝试从旧容器的 `/app/data/data.db`、`/app/backend/data.db` 或 `/app/data.db` 复制 SQLite 数据，帮助项目首次切换到持久化挂载时保留线上数据。
 
 ## 快速启动
 

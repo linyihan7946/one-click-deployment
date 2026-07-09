@@ -1500,6 +1500,28 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             log_message("远程目录需要 sudo 初始化，已授权给当前 SSH 用户", "warn")
         log_message(f"远程目录: {remote_dir}")
 
+        # 保护已有 SQLite 数据：首次改为持久化挂载时，把旧容器内数据库复制到远程 data/。
+        # 只在目标 data/data.db 不存在时执行，避免覆盖线上新数据。
+        expected_container_name = f"{project_slug}-app"
+        preserve_db_cmd = (
+            f"mkdir -p {shlex.quote(remote_dir + '/data')}; "
+            f"if [ ! -f {shlex.quote(remote_dir + '/data/data.db')} ]; then "
+            f"if docker ps -a --format '{{{{.Names}}}}' | grep -Fx {shlex.quote(expected_container_name)} >/dev/null 2>&1; then "
+            "for db_path in /app/data/data.db /app/backend/data.db /app/data.db; do "
+            f"if docker exec {shlex.quote(expected_container_name)} test -f \"$db_path\" >/dev/null 2>&1; then "
+            f"docker cp {shlex.quote(expected_container_name)}:\"$db_path\" {shlex.quote(remote_dir + '/data/data.db')} "
+            "&& echo preserved:$db_path; break; "
+            "fi; "
+            "done; "
+            "fi; "
+            "fi"
+        )
+        rc, preserve_out, preserve_err = ssh.exec_command(preserve_db_cmd, timeout=60)
+        if preserve_out.strip():
+            log_message(f"已保护旧容器 SQLite 数据: {preserve_out.strip()}")
+        if rc != 0 and preserve_err.strip():
+            log_message(f"旧 SQLite 数据保护检查失败，将继续部署: {preserve_err.strip()}", "warn")
+
         # Step 5: 同步文件 (50-70%) — 使用 SFTP
         set_progress(50, "同步文件到服务器...")
         log_message("开始同步文件（SFTP）...")
@@ -1518,6 +1540,13 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             ".deploy-logs",
             ".deploy-ssh",
             "logs",
+            "data.db",
+            "data.db-shm",
+            "data.db-wal",
+            "*.sqlite",
+            "*.sqlite3",
+            "*.db-shm",
+            "*.db-wal",
             "*.log",
             "*.pyc",
             ".DS_Store",
@@ -1546,25 +1575,25 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
         compose_content = data.get("docker_compose", "")
         dockerfile_content = data.get("dockerfile", "")
 
-        # 优先使用项目自带的 docker-compose.yml / Dockerfile
+        # 优先使用项目自带的 docker-compose.yml / Dockerfile。
+        # 项目内的部署文件通常包含 volume、env_file 等运行时数据保护配置，
+        # 比 Web 页面默认模板更准确。
         local_compose = os.path.join(source_path, "docker-compose.yml")
-        if os.path.isfile(local_compose) and (not compose_content or project_type == "monorepo"):
-            if os.path.isfile(local_compose):
-                with open(local_compose, "r", encoding="utf-8") as f:
-                    compose_content = f.read()
-                log_message("使用项目自带的 docker-compose.yml")
+        if os.path.isfile(local_compose):
+            with open(local_compose, "r", encoding="utf-8") as f:
+                compose_content = f.read()
+            log_message("使用项目自带的 docker-compose.yml")
 
         if project_type == "monorepo" and os.path.isfile(local_compose):
             with open(local_compose, "r", encoding="utf-8") as f:
                 compose_content = f.read()
             log_message("monorepo 项目优先使用项目自带的 docker-compose.yml")
 
-        if not dockerfile_content:
-            local_df = os.path.join(source_path, "Dockerfile")
-            if os.path.isfile(local_df):
-                with open(local_df, "r", encoding="utf-8") as f:
-                    dockerfile_content = f.read()
-                log_message("使用项目自带的 Dockerfile")
+        local_df = os.path.join(source_path, "Dockerfile")
+        if os.path.isfile(local_df):
+            with open(local_df, "r", encoding="utf-8") as f:
+                dockerfile_content = f.read()
+            log_message("使用项目自带的 Dockerfile")
 
         # Only use templates if still no content
         if project_type == "monorepo" and not compose_content:
@@ -1644,7 +1673,6 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             return
 
         log_message("执行 docker compose up -d...")
-        expected_container_name = f"{project_slug}-app"
         expected_container_q = shlex.quote(expected_container_name)
         cleanup_conflict_cmd = (
             "existing_id=$(docker ps -aq --filter "
@@ -1838,6 +1866,6 @@ if __name__ == "__main__":
  |_____/ \\____/|_|  \\_\\  |_|  |______\\_____|
 
   一键部署 - Web 可视化部署工具
-  http://localhost:5000
+  http://localhost:5001
 """)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5001, debug=False)
