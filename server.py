@@ -1027,6 +1027,10 @@ location {route_path}/ {{
     proxy_connect_timeout 60s;
     proxy_read_timeout 300s;
     proxy_send_timeout 300s;
+    # 禁止网关缓存，确保前端更新即时生效
+    add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+    add_header Pragma "no-cache" always;
+    add_header Expires "0" always;
 }}
 """
 
