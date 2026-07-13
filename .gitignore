@@ -8,6 +8,7 @@ deploy_config.json
 
 # 部署日志
 logs/
+*.log
 
 # 临时文件
 *.tar.gz
