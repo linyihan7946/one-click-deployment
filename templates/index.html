@@ -743,11 +743,6 @@
                 </div>
             </div>
 
-            <div class="form-group">
-                <label>环境变量 <span style="color:var(--text-muted);font-size:12px;">（每行一个，格式：KEY=VALUE）</span></label>
-                <textarea id="envVars" rows="4" spellcheck="false" placeholder="例如：&#10;API_KEY=your_api_key_here&#10;DATABASE_URL=postgres://..."></textarea>
-            </div>
-
             <div class="deploy-btn-area">
                 <button class="deploy-big-btn" id="deployBtn" onclick="startDeploy()">
                     🚀 一键部署
@@ -1581,7 +1576,6 @@ networks:
                 project_type: currentProjectType,
                 docker_compose: document.getElementById('dockerCompose').value,
                 dockerfile: document.getElementById('dockerfile').value,
-                env_vars: document.getElementById('envVars').value,
             };
 
             document.getElementById('deployBtn').disabled = true;

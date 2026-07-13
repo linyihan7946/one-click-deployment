@@ -1740,8 +1740,13 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
                 f.write(dockerfile_content)
             log_message("Dockerfile 已写入")
 
-        # 写入 .env 文件（环境变量）
-        env_vars_content = data.get("env_vars", "").strip()
+        # 写入 .env 文件（环境变量）— 自动从本地项目目录读取
+        local_env_path = os.path.join(source_path, ".env")
+        env_vars_content = ""
+        if os.path.isfile(local_env_path):
+            with open(local_env_path, "r", encoding="utf-8", errors="replace") as f:
+                env_vars_content = f.read().strip()
+            log_message("已读取本地 .env 文件")
         if env_vars_content:
             sftp = ssh.client.open_sftp()
             with sftp.file(f"{remote_dir}/.env", "w") as f:
