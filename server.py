@@ -1095,7 +1095,7 @@ server {{
 }}
 
 location {route_path}/ {{
-    proxy_pass http://{container_name}:{target_port};
+    proxy_pass http://{container_name}:{target_port}/;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -1665,6 +1665,9 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             project_type, detect_reason = detect_project_type_for_path(source_path)
             if project_type:
                 log_message(f"自动识别项目类型: {project_type} ({detect_reason})")
+        if project_type and module_config.get("project_type") != project_type:
+            module_config["project_type"] = project_type
+            save_config(config)
 
         compose_content = data.get("docker_compose", "")
         dockerfile_content = data.get("dockerfile", "")
