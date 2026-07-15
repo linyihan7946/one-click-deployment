@@ -905,8 +905,26 @@ class SSHClient:
             if not stat.S_ISDIR(getattr(attrs, "st_mode", 0)):
                 raise RuntimeError(f"Remote path exists but is not a directory: {current}")
 
-    def upload_dir(self, local_dir, remote_dir, excludes=None):
-        """上传目录到远程（SFTP）"""
+    @staticmethod
+    def _should_exclude_upload_entry(name, depth, excludes):
+        """Return whether an upload entry matches an exact name or glob rule."""
+        name_lower = name.lower()
+        root_only_excludes = {".env"}
+        for pattern in excludes:
+            pattern_lower = pattern.strip("/").lower()
+            if not pattern_lower:
+                continue
+            if "*" in pattern_lower or "?" in pattern_lower:
+                if fnmatch.fnmatch(name_lower, pattern_lower):
+                    return True
+            elif pattern_lower == name_lower:
+                if pattern_lower in root_only_excludes and depth > 0:
+                    continue
+                return True
+        return False
+
+    def upload_dir(self, local_dir, remote_dir, excludes=None, progress_callback=None):
+        """增量上传目录到远程，并返回同步统计。"""
         if not self.client:
             return False, "SSH 未连接"
 
@@ -920,45 +938,50 @@ class SSHClient:
         if excludes is None:
             excludes = []
 
-        import traceback
-
         sftp = self.client.open_sftp()
 
         try:
-            # Patterns that should only be excluded at the root level (depth 0)
-            _root_only_excludes = {".env"}
+            started_at = time.monotonic()
+            last_progress_at = started_at
+            stats = {
+                "checked": 0,
+                "uploaded": 0,
+                "skipped": 0,
+                "excluded": 0,
+                "bytes_uploaded": 0,
+                "bytes_skipped": 0,
+                "elapsed_seconds": 0.0,
+            }
 
-            def _should_exclude(name, depth=0):
-                name_lower = name.lower()
-                for exc in excludes:
-                    exc = exc.strip("/").lower()
-                    if "*" in exc or "?" in exc:
-                        if fnmatch.fnmatch(name_lower, exc):
-                            return True
-                    else:
-                        if exc == name_lower or exc in name_lower:
-                            # Some patterns (like .env) only apply at root level
-                            if exc in _root_only_excludes and depth > 0:
-                                continue
-                            return True
-                return False
+            def _report_progress(force=False):
+                nonlocal last_progress_at
+                now = time.monotonic()
+                if not force and stats["checked"] % 500 != 0 and now - last_progress_at < 5:
+                    return
+                stats["elapsed_seconds"] = round(now - started_at, 1)
+                if progress_callback:
+                    progress_callback(dict(stats))
+                last_progress_at = now
 
-            def _ensure_remote_dir(sftp_conn, rdir):
-                """递归创建远程目录"""
-                parts = rdir.replace("\\", "/").strip("/").split("/")
-                current = ""
-                for part in parts:
-                    current = current + "/" + part
-                    try:
-                        sftp_conn.stat(current)
-                    except IOError:
-                        try:
-                            sftp_conn.mkdir(current)
-                        except IOError:
-                            pass
+            def _remote_entries(remote):
+                return {entry.filename: entry for entry in sftp.listdir_attr(remote)}
+
+            def _remote_is_directory(entry):
+                mode = getattr(entry, "st_mode", 0) or 0
+                return stat.S_ISDIR(mode)
+
+            def _is_unchanged(local_attrs, remote_attrs):
+                if remote_attrs is None or _remote_is_directory(remote_attrs):
+                    return False
+                remote_size = getattr(remote_attrs, "st_size", None)
+                remote_mtime = getattr(remote_attrs, "st_mtime", None)
+                if remote_size != local_attrs.st_size or remote_mtime is None:
+                    return False
+                # 旧版上传未保留源时间戳，目标时间通常晚于源文件；新上传则时间戳相同。
+                return int(remote_mtime) >= int(local_attrs.st_mtime)
 
             def _upload_recursive(local, remote, depth=0):
-                self._ensure_remote_dir(sftp, remote)
+                remote_entries = _remote_entries(remote)
 
                 try:
                     items = os.listdir(local)
@@ -968,20 +991,42 @@ class SSHClient:
                     return
 
                 for item in items:
-                    if _should_exclude(item, depth):
+                    if self._should_exclude_upload_entry(item, depth, excludes):
+                        stats["excluded"] += 1
                         continue
 
                     local_path = os.path.join(local, item)
                     remote_path = remote + "/" + item
+                    remote_attrs = remote_entries.get(item)
 
                     if os.path.islink(local_path):
                         continue
 
                     if os.path.isdir(local_path):
+                        if remote_attrs is None:
+                            sftp.mkdir(remote_path)
+                        elif not _remote_is_directory(remote_attrs):
+                            raise RuntimeError(f"远程路径不是目录: {remote_path}")
                         _upload_recursive(local_path, remote_path, depth + 1)
                     elif os.path.isfile(local_path):
+                        local_attrs = os.stat(local_path)
+                        stats["checked"] += 1
+                        if _is_unchanged(local_attrs, remote_attrs):
+                            stats["skipped"] += 1
+                            stats["bytes_skipped"] += local_attrs.st_size
+                            _report_progress()
+                            continue
                         try:
-                            sftp.put(local_path, remote_path)
+                            sftp.put(local_path, remote_path, confirm=False)
+                            try:
+                                local_mtime = int(local_attrs.st_mtime)
+                                sftp.utime(remote_path, (local_mtime, local_mtime))
+                            except OSError:
+                                # 上传已经成功；不支持 utime 的服务器下次仍可用“目标时间较新”判断。
+                                pass
+                            stats["uploaded"] += 1
+                            stats["bytes_uploaded"] += local_attrs.st_size
+                            _report_progress()
                         except Exception as e:
                             import traceback
                             tb = traceback.format_exc()
@@ -990,8 +1035,10 @@ class SSHClient:
                                 f"Error: {e}\n{tb}"
                             ) from e
 
+            self._ensure_remote_dir(sftp, remote_dir)
             _upload_recursive(local_dir, remote_dir)
-            return True, ""
+            _report_progress(force=True)
+            return True, stats
 
         except Exception as e:
             import traceback
@@ -1633,6 +1680,10 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             ".idea",
             ".deploy-logs",
             ".deploy-ssh",
+            ".agents",
+            ".codex",
+            "venv",
+            ".venv",
             "logs",
             "data.db",
             "data.db-shm",
@@ -1647,11 +1698,30 @@ def run_deploy(server_name, module_name, source_path, server_path, data):
             "Thumbs.db",
         ]
 
-        success, err_msg = ssh.upload_dir(source_path, remote_dir, excludes=excludes)
+        def report_sync_progress(sync_stats):
+            log_message(
+                "SFTP 同步中："
+                f"已检查 {sync_stats['checked']} 个文件，"
+                f"上传 {sync_stats['uploaded']} 个，跳过 {sync_stats['skipped']} 个"
+            )
+
+        success, sync_result = ssh.upload_dir(
+            source_path,
+            remote_dir,
+            excludes=excludes,
+            progress_callback=report_sync_progress,
+        )
         if success:
-            log_message("文件同步完成（SFTP）")
+            uploaded_mib = sync_result["bytes_uploaded"] / 1024 / 1024
+            skipped_mib = sync_result["bytes_skipped"] / 1024 / 1024
+            log_message(
+                "文件同步完成（SFTP 增量）："
+                f"检查 {sync_result['checked']} 个，上传 {sync_result['uploaded']} 个 "
+                f"({uploaded_mib:.2f} MiB)，跳过 {sync_result['skipped']} 个 "
+                f"({skipped_mib:.2f} MiB)，耗时 {sync_result['elapsed_seconds']:.1f} 秒"
+            )
         else:
-            log_message(f"文件同步失败: {err_msg}", "error")
+            log_message(f"文件同步失败: {sync_result}", "error")
             set_progress(0, "文件同步失败")
             return
 
